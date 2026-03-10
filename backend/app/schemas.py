@@ -21,6 +21,7 @@ class TechnicalParameters(BaseModel):
     unit: str | None = None
     reference_product: str | None = None
     installation_area: str | None = None
+    sortiment_relevant: bool | None = None
 
 
 class LVPosition(BaseModel):
@@ -37,11 +38,20 @@ class LVPosition(BaseModel):
     parameters: TechnicalParameters = Field(default_factory=TechnicalParameters)
 
 
+class DuplicateInfo(BaseModel):
+    is_duplicate: bool
+    project_id: int | None = None
+    project_name: str | None = None
+    created_at: datetime | None = None
+    total_positions: int | None = None
+
+
 class ParseLVResponse(BaseModel):
     positions: list[LVPosition]
     total_positions: int
     billable_positions: int
     service_positions: int = 0
+    duplicate: DuplicateInfo | None = None
 
 
 class ScoreBreakdown(BaseModel):
@@ -65,6 +75,7 @@ class ProductSuggestion(BaseModel):
     total_net: float | None = None
     currency: str = "EUR"
     score: float
+    confidence: str | None = None
     reasons: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     score_breakdown: list[ScoreBreakdown] = Field(default_factory=list)
@@ -153,3 +164,18 @@ class CompatibilityCheckRequest(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+
+
+class ProjectSummary(BaseModel):
+    id: int
+    filename: str | None = None
+    project_name: str | None = None
+    total_positions: int
+    billable_positions: int
+    service_positions: int
+    created_at: datetime
+
+
+class ProjectDetailResponse(BaseModel):
+    project: ProjectSummary
+    positions: list[LVPosition]

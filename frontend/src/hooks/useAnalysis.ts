@@ -1,8 +1,9 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
-import { ApiError, checkCompatibility, exportOffer, fetchExportPreview, fetchSingleSuggestions, fetchSuggestions, parseLV } from '../api'
+import { ApiError, checkCompatibility, exportOffer, fetchExportPreview, fetchProject, fetchSingleSuggestions, fetchSuggestions, parseLV } from '../api'
 import type {
   AnalysisStep,
   CompatibilityIssue,
+  DuplicateInfo,
   ExportPreviewResponse,
   LVPosition,
   PositionSuggestions,
@@ -27,6 +28,7 @@ export function useAnalysis() {
   const [exportPreview, setExportPreview] = useState<ExportPreviewResponse | null>(null)
   const [showExportDialog, setShowExportDialog] = useState(false)
   const [isRefreshingSuggestions, setIsRefreshingSuggestions] = useState(false)
+  const [duplicateInfo, setDuplicateInfo] = useState<DuplicateInfo | null>(null)
 
   const abortRef = useRef<AbortController | null>(null)
   const compatTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
@@ -86,6 +88,7 @@ export function useAnalysis() {
       const parseData = await parseLV(file, controller.signal)
       setPositions(parseData.positions)
       setActivePositionId(parseData.positions[0]?.id ?? null)
+      setDuplicateInfo(parseData.duplicate ?? null)
 
       // Auto-skip positions the LLM classified as service
       const autoSkipped = new Set(
@@ -316,6 +319,56 @@ export function useAnalysis() {
     recheckCompatibility(positions, defaults)
   }, [positionSuggestions, skippedPositionIds, positions, recheckCompatibility])
 
+  const handleLoadProject = useCallback(async (projectId: number) => {
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
+    const timeoutId = setTimeout(() => controller.abort(), 300_000)
+
+    setErrorText(null)
+    setFile(null)
+    setDuplicateInfo(null)
+    setStep('matching')
+
+    try {
+      const { project, positions: loadedPositions } = await fetchProject(projectId)
+      setPositions(loadedPositions)
+      setActivePositionId(loadedPositions[0]?.id ?? null)
+      setProjectName(project.project_name ?? '')
+
+      const autoSkipped = new Set(
+        loadedPositions
+          .filter((p) => p.position_type === 'dienstleistung')
+          .map((p) => p.id),
+      )
+      setSkippedPositionIds(autoSkipped)
+
+      const suggestionData = await fetchSuggestions(loadedPositions, controller.signal)
+      setPositionSuggestions(suggestionData.suggestions)
+      setCompatibilityIssues(suggestionData.compatibility_issues)
+
+      const defaults: Record<string, string> = {}
+      suggestionData.suggestions.forEach((entry) => {
+        if (entry.suggestions.length > 0) {
+          defaults[entry.position_id] = entry.suggestions[0].artikel_id
+        }
+      })
+      setSelectedArticleIds(defaults)
+      setStep('done')
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        setErrorText('Laden wurde abgebrochen.')
+      } else if (error instanceof ApiError) {
+        setErrorText(error.message)
+      } else {
+        setErrorText(error instanceof Error ? error.message : 'Unbekannter Fehler')
+      }
+      setStep('error')
+    } finally {
+      clearTimeout(timeoutId)
+    }
+  }, [])
+
   const handleReset = useCallback(() => {
     abortRef.current?.abort()
     setFile(null)
@@ -327,6 +380,7 @@ export function useAnalysis() {
     setSkippedPositionIds(new Set())
     setExportPreview(null)
     setShowExportDialog(false)
+    setDuplicateInfo(null)
     setStep('idle')
     setErrorText(null)
   }, [])
@@ -352,6 +406,7 @@ export function useAnalysis() {
     suggestionMap,
     skippedPositionIds,
     isRefreshingSuggestions,
+    duplicateInfo,
     showExportDialog,
     exportPreview,
     handleAnalyze,
@@ -363,6 +418,7 @@ export function useAnalysis() {
     handleExportPreview,
     handleExportConfirm,
     handleExportCancel,
+    handleLoadProject,
     handleReset,
     handleAcceptAllTop,
   }

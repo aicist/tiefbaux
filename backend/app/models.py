@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Float, Index, Integer, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
 
@@ -56,3 +57,36 @@ class Product(Base):
 
 
 Index("ix_products_category_dn", Product.kategorie, Product.unterkategorie, Product.nennweite_dn)
+
+
+class LVProject(Base):
+    __tablename__ = "lv_projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    content_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    filename: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    project_name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    total_positions: Mapped[int] = mapped_column(Integer, default=0)
+    billable_positions: Mapped[int] = mapped_column(Integer, default=0)
+    service_positions: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    positions = relationship("LVProjectPosition", back_populates="project", cascade="all, delete-orphan")
+
+
+class LVProjectPosition(Base):
+    __tablename__ = "lv_project_positions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("lv_projects.id"), index=True)
+    position_id: Mapped[str] = mapped_column(String(64))
+    ordnungszahl: Mapped[str] = mapped_column(String(32))
+    description: Mapped[str] = mapped_column(Text)
+    raw_text: Mapped[str] = mapped_column(Text)
+    quantity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    unit: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    billable: Mapped[bool] = mapped_column(default=True)
+    position_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    parameters_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    project = relationship("LVProject", back_populates="positions")

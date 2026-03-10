@@ -1,4 +1,4 @@
-import type { CompatibilityIssue, ExportPreviewResponse, LVPosition, ParseResponse, PositionSuggestions, ProductSearchResult, SuggestionResponse } from './types'
+import type { CompatibilityIssue, ExportPreviewResponse, LVPosition, ParseResponse, PositionSuggestions, ProductSearchResult, ProjectDetailResponse, ProjectSummary, SuggestionResponse } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000/api'
 
@@ -165,4 +165,23 @@ export async function checkCompatibility(
     }),
   )
   return handleResponse<CompatibilityIssue[]>(response)
+}
+
+export async function fetchProjects(): Promise<ProjectSummary[]> {
+  const response = await wrapFetch(fetch(`${API_BASE}/projects`))
+  return handleResponse<ProjectSummary[]>(response)
+}
+
+export async function fetchProject(projectId: number): Promise<ProjectDetailResponse> {
+  const response = await wrapFetch(fetch(`${API_BASE}/projects/${projectId}`))
+  return handleResponse<ProjectDetailResponse>(response)
+}
+
+export async function deleteProject(projectId: number): Promise<void> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/projects/${projectId}`, { method: 'DELETE' }),
+  )
+  if (!response.ok) {
+    await handleResponse(response)
+  }
 }

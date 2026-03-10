@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -46,7 +47,13 @@ SYSTEM_INSTRUCTION = (
     "  OZ 25.xxx = Gasversorgung → Rohre sind 'Gasrohre' (nicht Kanalrohre!)\n"
     "  OZ 30.xxx = Wasserversorgung → Rohre sind 'Wasserrohre' (nicht Kanalrohre!)\n"
     "  OZ 35.xxx = Kabelschutz → Rohre sind 'Kabelschutz' (nicht Kanalrohre!)\n"
-    "  OZ 01.xxx oder ohne klaren Gewerk-Praefix = Kanalrohre/Entwaesserung\n\n"
+    "  OZ 01.xxx oder ohne klaren Gewerk-Praefix = Kanalrohre/Entwaesserung\n"
+    "- WICHTIG: Wenn das Material vom Auftraggeber gestellt/beigestellt wird "
+    "(z.B. 'wird durch den AG ... gestellt', 'ab Lager des AG', 'beigestellt'), "
+    "ist es 'dienstleistung' - der Auftragnehmer liefert kein Material!\n"
+    "- Verbindungsleitungen in der Hausinstallation (inkl. Fittings/Befestigungen) "
+    "sind 'material', da der Auftragnehmer Rohr und Fittings mitbringt - "
+    "gilt fuer Gas UND Wasser gleichermassen.\n\n"
     "Erkenne alle gaengigen Einheiten: m, m2, m², m3, m³, Stk, Stck, St, Stueck, kg, to, t, "
     "h, Std, StD, lfm, lfdm, lfd.m, Psch, psch, Pausch, Wo, mWo, cbm, etc.\n\n"
     "Gib ein JSON-Array zurueck. Jedes Objekt hat diese Felder:\n"
@@ -55,16 +62,26 @@ SYSTEM_INSTRUCTION = (
     "- quantity: number | null\n"
     "- unit: string | null\n"
     "- position_type: 'material' | 'dienstleistung'\n"
-    "- product_category: string | null (nur fuer material; verwende nur: Kanalrohre, "
-    "Schachtabdeckungen, Schachtbauteile, Formstuecke, Strassenentwässerung, Rinnen, "
-    "Dichtungen & Zubehoer, Geotextilien, Gasrohre, Wasserrohre, Kabelschutz)\n"
+    "- product_category: string | null (nur fuer material; verwende AUSSCHLIESSLICH "
+    "einen dieser Werte oder null: Kanalrohre, Schachtabdeckungen, Schachtbauteile, "
+    "Formstuecke, Strassenentwässerung, Rinnen, Dichtungen & Zubehoer, Geotextilien, "
+    "Gasrohre, Wasserrohre, Druckrohre, Kabelschutz. "
+    "Wenn keine Kategorie passt (z.B. Sand, Asphalt, Pflaster, Bordsteine, Oberboden), "
+    "setze null!)\n"
     "- product_subcategory: string | null\n"
-    "- material: string | null (PP, PVC-U, Stahlbeton, Beton, Gusseisen, HDPE, Steinzeug)\n"
+    "- material: string | null (PP, PVC-U, Stahlbeton, Beton, Gusseisen, HDPE, PE, PE 100, PE 100-RC, Steinzeug)\n"
     "- nominal_diameter_dn: integer | null\n"
     "- load_class: string | null (A15, B125, C250, D400, E600, F900)\n"
     "- norm: string | null\n"
     "- reference_product: string | null\n"
-    "- installation_area: string | null (Fahrbahn, Gehweg, Erdeinbau)\n\n"
+    "- installation_area: string | null (Fahrbahn, Gehweg, Erdeinbau)\n"
+    "- sortiment_relevant: boolean (true wenn ein Tiefbau-Baustoffhaendler dieses Produkt "
+    "fuehren wuerde: Rohre, Schaechte, Formstücke, Abdeckungen, Rinnen, Dichtungen, "
+    "Geotextilien, Druckrohre, Kabelschutzrohre. "
+    "false fuer: Stuetzmauern, Bordsteine, Pflaster, Asphalt, Poller, Blockstufen, "
+    "Sand/Kies/Schotter als reines Schuettgut, Hydrantenarmaturen, Zaeune, Beleuchtung, "
+    "Rasensaat, Oberboden, Hausanschlussgarnituren. "
+    "Bei Dienstleistungen: false)\n\n"
     "Fuer Dienstleistungs-Positionen setze alle technischen Parameter auf null.\n"
     "Ueberspringe Ueberschriften (z.B. '1.5 Entwaesserungsleitungen'), Vorbemerkungen, "
     "Hinweise und nicht-bepreisbare Zeilen (ohne Menge/Einheit).\n"
@@ -201,6 +218,7 @@ def _assemble_position(idx: int, raw: dict[str, Any]) -> LVPosition:
         unit=unit,
         reference_product=raw.get("reference_product"),
         installation_area=raw.get("installation_area"),
+        sortiment_relevant=raw.get("sortiment_relevant"),
     )
 
     return LVPosition(
@@ -216,13 +234,59 @@ def _assemble_position(idx: int, raw: dict[str, Any]) -> LVPosition:
     )
 
 
+_VALID_CATEGORIES = {
+    "kanalrohre", "schachtabdeckungen", "schachtbauteile", "formstuecke",
+    "formstücke", "strassenentwässerung", "strassenentwaesserung", "rinnen",
+    "dichtungen & zubehoer", "dichtungen & zubehör", "geotextilien",
+    "gasrohre", "wasserrohre", "druckrohre", "kabelschutz",
+}
+
+_CLIENT_PROVIDED_RE = re.compile(
+    r"(?:wird\s+(?:durch|vom)\s+(?:den\s+)?AG\b.*?gestellt"
+    r"|ab\s+Lager\s+(?:des\s+)?AG\b"
+    r"|beigestellt"
+    r"|vom\s+AG\s+bereitgestellt"
+    r"|AG\s+ab\s+Lager\b.*?gestellt)",
+    re.IGNORECASE,
+)
+
+
 def _validate_with_heuristics(positions: list[LVPosition]) -> list[LVPosition]:
     """Run heuristic enrichment to fill gaps the LLM might have left."""
     validated: list[LVPosition] = []
     for pos in positions:
+        # Fix: reclassify material→DL if material is provided by client (AG)
+        if pos.position_type == "material" and _CLIENT_PROVIDED_RE.search(pos.description or ""):
+            logger.info(
+                "Reclassifying %s '%s' from material→dienstleistung (material provided by client)",
+                pos.ordnungszahl, pos.description[:60],
+            )
+            pos = pos.model_copy(update={
+                "position_type": "dienstleistung",
+                "billable": False,
+                "parameters": TechnicalParameters(
+                    product_category=None, product_subcategory=None,
+                    material=None, nominal_diameter_dn=None,
+                    load_class=None, norm=None, dimensions=None,
+                    color=None, quantity=pos.quantity, unit=pos.unit,
+                    reference_product=None, installation_area=None,
+                ),
+            })
+
         if pos.position_type == "dienstleistung":
             validated.append(pos)
             continue
+
+        # Sanitize invalid categories
+        cat = pos.parameters.product_category
+        if cat and cat.lower() not in _VALID_CATEGORIES:
+            logger.info(
+                "Stripping invalid category '%s' from %s '%s'",
+                cat, pos.ordnungszahl, pos.description[:60],
+            )
+            pos = pos.model_copy(update={
+                "parameters": pos.parameters.model_copy(update={"product_category": None}),
+            })
 
         heuristic_params = _infer_with_heuristics(pos)
         merged = pos.parameters.model_dump()

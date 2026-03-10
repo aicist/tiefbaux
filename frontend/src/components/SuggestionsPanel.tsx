@@ -148,7 +148,7 @@ export function SuggestionsPanel({
                           </summary>
                           <div className="score-breakdown">
                             {suggestion.score_breakdown.map((b) => (
-                              <div key={b.component} className="breakdown-row">
+                              <div key={b.component} className={`breakdown-row ${b.points > 0 ? 'row-positive' : b.points < 0 ? 'row-negative' : 'row-neutral'}`}>
                                 <span className="breakdown-component">{b.component}</span>
                                 <span className={`breakdown-points ${b.points >= 0 ? 'positive' : 'negative'}`}>
                                   {b.points > 0 ? '+' : ''}{b.points}

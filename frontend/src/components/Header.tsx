@@ -1,4 +1,11 @@
-export function Header() {
+import type { AppView } from '../types'
+
+type Props = {
+  activeView: AppView
+  onViewChange: (view: AppView) => void
+}
+
+export function Header({ activeView, onViewChange }: Props) {
   return (
     <header className="app-header">
       <div className="header-content">
@@ -14,6 +21,20 @@ export function Header() {
             <p className="subtitle">Leistungsverzeichnis-Analyse & Angebotsassistent</p>
           </div>
         </div>
+        <nav className="view-tabs">
+          <button
+            className={`view-tab ${activeView === 'analysis' ? 'view-tab--active' : ''}`}
+            onClick={() => onViewChange('analysis')}
+          >
+            Neue Analyse
+          </button>
+          <button
+            className={`view-tab ${activeView === 'archive' ? 'view-tab--active' : ''}`}
+            onClick={() => onViewChange('archive')}
+          >
+            Projektarchiv
+          </button>
+        </nav>
       </div>
     </header>
   )

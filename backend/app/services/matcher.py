@@ -119,13 +119,18 @@ def _guess_category(position: LVPosition) -> tuple[str | None, str | None]:
 
     # Use OZ prefix to detect domain for pipe positions
     oz = (position.ordnungszahl or "").strip()
-    if re.search(r"\brohr\b", text) and re.search(r"\bdn\s*\d", text):
+    is_pipe = re.search(r"\brohr\b", text) and re.search(r"\bdn\s*\d", text)
+    is_druckrohr = "druckrohr" in text or "druckleitung" in text or "pe\s*100" in text or "pe-hd" in text
+    if is_pipe or is_druckrohr:
         if oz.startswith("25"):
             return "Gasrohre", None
         if oz.startswith("30"):
             return "Wasserrohre", None
         if oz.startswith("35"):
             return "Kabelschutz", None
+        if is_druckrohr:
+            # Generic pressure pipe — let matcher try all pressure categories
+            return "Druckrohre", None
         return "Kanalrohre", "KG-Rohre"
     if re.search(r"\bkg\b", text) and re.search(r"\bdn\b", text):
         return "Kanalrohre", "KG-Rohre"
@@ -255,6 +260,14 @@ def _text_similarity_score(position_tokens: set[str], product: Product) -> float
     return (len(overlap) / max(1, len(position_tokens))) * 20
 
 
+# Related pressure pipe categories — partial match when categories differ
+_RELATED_CATEGORIES: dict[str, set[str]] = {
+    "gasrohre": {"druckrohre"},
+    "wasserrohre": {"druckrohre"},
+    "druckrohre": {"gasrohre", "wasserrohre"},
+}
+
+
 def _category_match_score(category: str | None, subcategory: str | None, product: Product) -> tuple[float, list[str]]:
     score = 0.0
     reasons: list[str] = []
@@ -270,6 +283,9 @@ def _category_match_score(category: str | None, subcategory: str | None, product
     elif category_norm and (category_norm in product_category or product_category in category_norm):
         score += 20
         reasons.append("Kategorie ähnlich")
+    elif category_norm and product_category in _RELATED_CATEGORIES.get(category_norm, set()):
+        score += 20
+        reasons.append(f"Kategorie verwandt ({product.kategorie})")
 
     if subcategory_norm and subcategory_norm == product_subcategory:
         score += 18
@@ -294,14 +310,25 @@ def _dn_score(required_dn: int | None, product: Product) -> tuple[float, list[st
         if dn_match:
             product_dn = int(dn_match.group(1))
 
+    # Also check OD for PE pressure pipes (LV often uses "DN 110" meaning OD 110)
+    product_od = product.nennweite_od
+
     if product_dn == required_dn:
         reasons.append(f"DN {required_dn} exakt")
+        return 25.0, reasons
+
+    # Match against OD (PE-Druckrohre use OD, not DN)
+    if product_od == required_dn:
+        reasons.append(f"OD {required_dn} exakt")
         return 25.0, reasons
 
     # Check DN equivalences (e.g. DN100 ↔ DN110)
     equivalent_dns = DN_EQUIVALENTS.get(required_dn, set())
     if product_dn in equivalent_dns:
         reasons.append(f"DN {required_dn}≈{product_dn} (äquivalent)")
+        return 22.0, reasons
+    if product_od in equivalent_dns:
+        reasons.append(f"OD {product_od}≈DN {required_dn} (äquivalent)")
         return 22.0, reasons
 
     compatible_dns = _parse_compatible_dns(product.kompatible_dn_anschluss)
@@ -315,11 +342,11 @@ def _dn_score(required_dn: int | None, product: Product) -> tuple[float, list[st
             reasons.append(f"DN {required_dn}≈{eq_dn} kompatibel")
             return 14.0, reasons
 
-    # Product has no DN info at all — don't penalize, just no bonus
-    if product_dn is None:
+    # Product has no DN or OD info at all — don't penalize, just no bonus
+    if product_dn is None and product_od is None:
         return 0.0, []
 
-    return -15.0, [f"DN weicht ab ({product_dn} ≠ {required_dn})"]
+    return -15.0, [f"DN weicht ab ({product_dn or product_od} ≠ {required_dn})"]
 
 
 def _load_class_score(required: str | None, product: Product) -> tuple[float, list[str]]:
@@ -384,6 +411,12 @@ def suggest_products_for_position(
     if position.position_type == "dienstleistung":
         return []
 
+    # LLM relevance filter: skip positions classified as not catalog-relevant
+    # (e.g. Stützmauern, Bordsteine, Pflaster — not sold by Baustoffhandel)
+    # Use `is False` so that None (unknown) still goes through normal matching
+    if position.parameters.sortiment_relevant is False:
+        return []
+
     category, subcategory = _guess_category(position)
     quantity = float(position.quantity or 1)
     quantity_defaulted = position.quantity is None or position.quantity == 0
@@ -412,11 +445,13 @@ def suggest_products_for_position(
     position_product_type = _detect_product_type(f"{position.description} {position.raw_text}")
 
     scored: list[tuple[float, Product, list[str], list[ScoreBreakdown]]] = []
+    cat_norm = _normalize(category) if category else ""
     for product in products:
         if category:
             product_category = _normalize(product.kategorie)
-            cat_norm = _normalize(category)
-            if cat_norm not in product_category and product_category not in cat_norm:
+            is_cat_match = cat_norm in product_category or product_category in cat_norm
+            is_related = product_category in _RELATED_CATEGORIES.get(cat_norm, set())
+            if not is_cat_match and not is_related:
                 if not subcategory or _normalize(subcategory) not in _normalize(product.unterkategorie or ""):
                     continue
 

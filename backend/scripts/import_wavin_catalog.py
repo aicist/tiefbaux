@@ -32,37 +32,59 @@ SYSTEM_INSTRUCTION = (
     "Jede Zeile in einer Produkttabelle ist ein separates Produkt.\n\n"
     "Gib ein JSON-Array zurueck. Jedes Objekt hat diese Felder:\n"
     "- artikel_nr: string (die 7-stellige Artikelnummer, z.B. '3042330')\n"
-    "- artikelname: string (vollstaendiger Name, z.B. 'Wavin KG Rohr DN110 1000mm')\n"
-    "- artikelbeschreibung: string (Tabellenbezeichnung + Produktgruppe, z.B. 'KG Mehrschicht Rohr mit einseitiger Steckmuffe KG-EM PVC DN110 L=1000mm')\n"
+    "- artikelname: string (vollstaendiger Name, z.B. 'Wavin KG Rohr DN110 1000mm' oder "
+    "'Wavin TS DOQ PE-Druckrohr OD110 SDR11 12m Trinkwasser')\n"
+    "- artikelbeschreibung: string (Tabellenbezeichnung + Produktgruppe + Medium + SDR/PN, z.B. "
+    "'KG Mehrschicht Rohr KG-EM PVC DN110 L=1000mm' oder "
+    "'Wavin TS DOQ PE 100-RC Druckrohr Trinkwasser SDR 11 PN 16bar Stange 12m OD 110mm')\n"
     "- kategorie: string (eine von: Kanalrohre, Schachtbauteile, Schachtabdeckungen, "
     "Formstuecke, Dichtungen & Zubehoer, Strassenentwässerung, Rinnen, "
-    "Versickerung, Regenwasser, Kabelschutz)\n"
-    "- unterkategorie: string (z.B. 'KG-Rohre', 'KG-Boegen', 'KG-Abzweige', 'KG-Reduzierstueck', "
-    "'Tegra Schachtboden', 'Tegra Schachtrohr', 'Tegra Konus', 'Tegra Abdeckung', "
-    "'Green Connect Rohr', 'Acaro Rohr', 'Strassenablauf', 'Dichtung', etc.)\n"
-    "- werkstoff: string | null (PVC-U, PP, PE, PP-HM, PP-MD, Beton, Guss, etc.)\n"
-    "- nennweite_dn: integer | null (DN-Wert, z.B. 110, 160, 200, 250, 315, 400, 500)\n"
-    "- nennweite_od: integer | null (Aussendurchmesser in mm wenn angegeben)\n"
-    "- laenge_mm: integer | null (Laenge in mm)\n"
+    "Versickerung, Regenwasser, Kabelschutz, Gasrohre, Wasserrohre, Druckrohre)\n"
+    "  WICHTIG fuer Druckrohrsysteme:\n"
+    "  - Wenn das Medium 'Gas' ist oder die Tabellenueberschrift 'Gas' enthaelt → kategorie = 'Gasrohre'\n"
+    "  - Wenn das Medium 'Trinkwasser' ist → kategorie = 'Wasserrohre'\n"
+    "  - Wenn das Medium 'Abwasser' ist (Druckrohr, nicht KG!) → kategorie = 'Druckrohre'\n"
+    "  - PE-Boegen/Universalboegen die fuer alle Medien gelten → kategorie = 'Formstuecke'\n"
+    "  - PVC-U Druckrohre fuer Trinkwasser → kategorie = 'Wasserrohre'\n"
+    "  - PVC-U Druckrohr Formteile (Boegen, Muffen) → kategorie = 'Formstuecke'\n"
+    "  - PVC Zubehoer (Dichtungen, Gleitmittel) → kategorie = 'Dichtungen & Zubehoer'\n"
+    "- unterkategorie: string (z.B. 'KG-Rohre', 'KG-Boegen', 'PE-Druckrohr', 'PE-Bogen', "
+    "'PVC-Druckrohr', 'PVC-Druckrohr-Bogen', 'PVC-Muffe', 'Dichtung', "
+    "'Tegra Schachtboden', 'Strassenablauf', etc.)\n"
+    "- werkstoff: string | null (PVC-U, PP, PE, PE 100, PE 100-RC, PP-HM, PP-MD, Beton, Guss, etc.)\n"
+    "- nennweite_dn: integer | null (DN-Wert bei PVC-U Druckrohren: DN 80, 100, 125, etc. "
+    "Bei PE-Rohren: NICHT den OD-Wert hier eintragen, sondern null lassen!)\n"
+    "- nennweite_od: integer | null (Aussendurchmesser OD in mm, besonders bei PE-Druckrohren: "
+    "32, 40, 50, 63, 75, 90, 110, 125, 140, 160, 180, 200, 225, 250, 280, 315, 355, 400, 450, 500)\n"
+    "- laenge_mm: integer | null (Laenge in mm. Baulaenge 6m = 6000, 12m = 12000. "
+    "Bei Ringbund 100m = 100000, 200m = 200000)\n"
     "- hoehe_mm: integer | null (Hoehe H in mm wenn angegeben)\n"
-    "- wandstaerke_mm: number | null (Wandstaerke e in mm)\n"
-    "- gewicht_kg: number | null (Gewicht in kg wenn angegeben)\n"
+    "- wandstaerke_mm: number | null (Wandstaerke s in mm, z.B. 3.0, 4.6, 10.0)\n"
+    "- gewicht_kg: number | null (Gewicht kg/m oder kg/Stk)\n"
     "- belastungsklasse: string | null (A15, B125, C250, D400, E600, F900)\n"
     "- steifigkeitsklasse: string | null (SN4, SN8, SN16)\n"
-    "- norm: string | null (DIN EN 13476-2, DIN EN 1401, DIN EN 1917, etc.)\n"
-    "- preis_eur_stk: number | null (Preis in EUR/Stk)\n"
-    "- preis_eur_m: number | null (Preis in EUR/m wenn angegeben)\n"
-    "- verpackungseinheit: integer | null (VP-EH Stk/Pal)\n"
-    "- winkel_grad: integer | null (Winkel bei Boegen: 15, 30, 45, 67, 87)\n"
+    "- sdr: string | null (SDR-Wert: 'SDR 11', 'SDR 17', etc.)\n"
+    "- druckstufe: string | null (Druckstufe: 'PN 10', 'PN 12.5', 'PN 16', etc.)\n"
+    "- medium: string | null ('Trinkwasser', 'Gas', 'Abwasser')\n"
+    "- lieferform: string | null ('Stange 6m', 'Stange 12m', 'Ringbund', 'Ringbund 100m')\n"
+    "- norm: string | null (DIN EN 12201-2, DIN EN 1555-2, DIN EN 1452, DIN EN 13476-2, etc.)\n"
+    "- preis_eur_stk: number | null (Preis in EUR/Stk bei Boegen und Formteilen)\n"
+    "- preis_eur_m: number | null (Preis in EUR/m bei Rohren)\n"
+    "- verpackungseinheit: integer | null (VPE Stk oder m)\n"
+    "- winkel_grad: integer | null (Winkel bei Boegen: 11, 22, 30, 45, 90)\n"
     "- dn_anschluss: integer | null (zweiter DN bei Abzweigen/Reduzierstuecken)\n"
-    "- system_familie: string | null ('Wavin KG', 'Wavin Tegra', 'Wavin Green Connect', 'Wavin Acaro', 'Wavin X-Stream', etc.)\n\n"
+    "- system_familie: string | null ('Wavin KG', 'Wavin Tegra', 'Wavin TS DOQ', "
+    "'Wavin SafeTech RC', 'Wavin PE 100-RC Druckrohr', 'Wavin PE 100 Druckrohr', "
+    "'Wavin PE 100-RC Universalbogen', 'Wavin PVC Druckrohr', etc.)\n\n"
     "REGELN:\n"
     "- Ueberspringe Ueberschriften, Bildseiten und Textbloecke ohne Produkttabellen\n"
     "- Wenn eine Zeile 'auf Anfrage' statt Artikel-Nr hat, setze artikel_nr auf null\n"
     "- Preise als Zahl ohne Waehrungssymbol (z.B. 15.75 nicht '15,75 EUR')\n"
     "- Deutsche Kommazahlen umwandeln: '15,75' -> 15.75\n"
     "- Bei KG-Rohren: Laenge steht oft als L-Spalte in mm (1.000 = 1000mm, 2.000 = 2000mm, 5.000 = 5000mm)\n"
+    "- Bei PE-Druckrohren: OD ist der Aussendurchmesser, NICHT DN! Trage OD in nennweite_od ein.\n"
     "- Jede Tabellenzeile = ein Produkt, auch wenn Bezeichnungen sich wiederholen\n"
+    "- WICHTIG: Achte auf den Tabellentitel fuer Medium-Zuordnung: 'Trinkwasser', 'Gas', 'Abwasser'\n"
     "- Gib NUR das JSON-Array zurueck, keine Erklaerung\n"
     "- Wenn die Seiten keine Produkttabellen enthalten, gib ein leeres Array [] zurueck"
 )
@@ -219,17 +241,26 @@ def _guess_norm(raw: dict[str, Any]) -> str | None:
     norm = raw.get("norm")
     if norm:
         return norm
-    # Infer from system family
+    # Infer from system family and category
     system = (raw.get("system_familie") or "").lower()
     werkstoff = (raw.get("werkstoff") or "").lower()
+    kategorie = (raw.get("kategorie") or "").lower()
+    medium = (raw.get("medium") or "").lower()
     if "kg" in system and "pvc" in werkstoff:
         return "DIN EN 1401"
-    if "acaro" in system or ("pp" in werkstoff and "rohr" in (raw.get("kategorie") or "").lower()):
+    if "acaro" in system or ("pp" in werkstoff and "rohr" in kategorie):
         return "DIN EN 13476-2"
     if "tegra" in system:
         return "DIN EN 13598-2"
     if "green connect" in system:
         return "DIN EN 13476-3"
+    # Druckrohre norms
+    if "pe" in werkstoff and ("wasser" in kategorie or "trinkwasser" in medium):
+        return "DIN EN 12201-2"
+    if "pe" in werkstoff and ("gas" in kategorie or "gas" in medium):
+        return "DIN EN 1555-2"
+    if "pvc" in werkstoff and ("wasser" in kategorie or "druck" in kategorie):
+        return "DIN EN ISO 1452"
     return None
 
 
@@ -260,17 +291,36 @@ def build_product(raw: dict[str, Any], idx: int) -> Product | None:
     elif dn_main:
         kompatible_dn = str(dn_main)
 
+    # Build enriched description with SDR/PN/medium info
+    beschreibung = raw.get("artikelbeschreibung") or ""
+    sdr = raw.get("sdr")
+    druckstufe = raw.get("druckstufe")
+    medium = raw.get("medium")
+    lieferform = raw.get("lieferform")
+    if sdr and sdr not in beschreibung:
+        beschreibung += f" {sdr}"
+    if druckstufe and druckstufe not in beschreibung:
+        beschreibung += f" {druckstufe}"
+    if medium and medium not in beschreibung:
+        beschreibung += f" {medium}"
+    if lieferform and lieferform not in beschreibung:
+        beschreibung += f" {lieferform}"
+
+    # For PE pressure pipes, also store OD as part of DN description
+    od = _to_int(raw.get("nennweite_od"))
+    einsatzbereich = medium
+
     return Product(
         artikel_id=f"WAV-{art_nr}",
         hersteller="Wavin GmbH",
         hersteller_artikelnr=art_nr,
         artikelname=artikelname,
-        artikelbeschreibung=raw.get("artikelbeschreibung"),
+        artikelbeschreibung=beschreibung.strip() or None,
         kategorie=raw.get("kategorie"),
         unterkategorie=raw.get("unterkategorie"),
         werkstoff=raw.get("werkstoff"),
         nennweite_dn=dn_main,
-        nennweite_od=_to_int(raw.get("nennweite_od")),
+        nennweite_od=od,
         laenge_mm=_to_int(raw.get("laenge_mm")),
         hoehe_mm=_to_int(raw.get("hoehe_mm")),
         wandstaerke_mm=_to_float(raw.get("wandstaerke_mm")),
@@ -280,6 +330,7 @@ def build_product(raw: dict[str, Any], idx: int) -> Product | None:
         norm_primaer=_guess_norm(raw),
         system_familie=raw.get("system_familie"),
         kompatible_dn_anschluss=kompatible_dn,
+        einsatzbereich=einsatzbereich,
         vk_listenpreis_netto=preis,
         waehrung="EUR",
         preiseinheit=preiseinheit,
@@ -292,18 +343,12 @@ def build_product(raw: dict[str, Any], idx: int) -> Product | None:
     )
 
 
-def main():
-    pdf_path = sys.argv[1] if len(sys.argv) > 1 else None
-    if not pdf_path:
-        # Try to find the Wavin PDF in project root
-        project_root = Path(__file__).resolve().parents[2]
-        candidates = list(project_root.glob("Wavin*.pdf"))
-        if not candidates:
-            logger.error("No Wavin PDF found. Pass path as argument.")
-            sys.exit(1)
-        pdf_path = str(candidates[0])
+def _process_pdf(pdf_path: str) -> list[dict[str, Any]]:
+    """Extract products from a single Wavin PDF."""
+    logger.info("=" * 60)
+    logger.info("Processing: %s", Path(pdf_path).name)
+    logger.info("=" * 60)
 
-    logger.info("Extracting text from %s", pdf_path)
     pages = extract_pages(pdf_path)
     logger.info("Extracted %d pages with text", len(pages))
 
@@ -329,7 +374,35 @@ def main():
         except Exception as exc:
             logger.warning("Batch %d failed: %s", batch_idx + 1, exc)
 
-    logger.info("Total raw products extracted: %d", len(all_raw))
+    logger.info("Raw products from %s: %d", Path(pdf_path).name, len(all_raw))
+    return all_raw
+
+
+def main():
+    # Collect PDF paths from arguments or auto-discover
+    pdf_paths: list[str] = []
+    if len(sys.argv) > 1:
+        pdf_paths = sys.argv[1:]
+    else:
+        project_root = Path(__file__).resolve().parents[2]
+        candidates = sorted(project_root.glob("Wavin*.pdf"))
+        pdf_paths = [str(p) for p in candidates]
+
+    if not pdf_paths:
+        logger.error("No Wavin PDFs found. Pass paths as arguments or place in project root.")
+        sys.exit(1)
+
+    logger.info("Found %d Wavin PDF(s) to process:", len(pdf_paths))
+    for p in pdf_paths:
+        logger.info("  - %s", Path(p).name)
+
+    # Process all PDFs
+    all_raw: list[dict[str, Any]] = []
+    for pdf_path in pdf_paths:
+        raw = _process_pdf(pdf_path)
+        all_raw.extend(raw)
+
+    logger.info("Total raw products from all PDFs: %d", len(all_raw))
 
     deduped = deduplicate(all_raw)
     logger.info("After deduplication: %d products", len(deduped))

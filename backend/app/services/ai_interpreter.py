@@ -174,10 +174,17 @@ def _call_gemini_batch(positions: list[LVPosition]) -> list[dict[str, Any]]:
         "Gib ein JSON-Array zurueck mit einem Objekt pro Position (gleiche Reihenfolge). "
         "Jedes Objekt hat diese Keys: "
         "product_category, product_subcategory, material, nominal_diameter_dn (Integer oder null), "
-        "load_class, norm, dimensions, color, reference_product, installation_area. "
+        "load_class, norm, dimensions, color, reference_product, installation_area, sortiment_relevant. "
         "Verwende fuer product_category nur: Kanalrohre, Schachtabdeckungen, Schachtbauteile, "
         "Formstücke, Straßenentwässerung, Rinnen, Dichtungen & Zubehör. "
-        "Setze null wenn ein Wert nicht erkennbar ist."
+        "Setze null wenn ein Wert nicht erkennbar ist.\n\n"
+        "sortiment_relevant (boolean): Ist diese Position ein Produkt das ein Tiefbau-/Baustoffhaendler "
+        "fuehren wuerde (Rohre, Schaechte, Formstücke, Abdeckungen, Rinnen, Dichtungen, Geotextilien, "
+        "Druckrohre, Kabelschutzrohre)? "
+        "NICHT relevant sind: Stuetzmauern, Fundamente, Bordsteine, Pflaster, Asphalt, Oberboden, "
+        "Rasen, Poller, Blockstufen, Zaeune, Beleuchtung, Sand/Kies/Schotter (als Schuettgut), "
+        "Hydrantenarmaturen, Hausanschlussgarnituren, reine Einbau-/Montagearbeiten. "
+        "Setze true wenn es ein Handelsprodukt ist, false wenn nicht."
     )
 
     pos_texts = []

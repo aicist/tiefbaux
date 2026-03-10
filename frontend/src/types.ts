@@ -11,6 +11,7 @@ export type TechnicalParameters = {
   unit?: string | null
   reference_product?: string | null
   installation_area?: string | null
+  sortiment_relevant?: boolean | null
 }
 
 export type LVPosition = {
@@ -46,6 +47,7 @@ export type ProductSuggestion = {
   total_net?: number | null
   currency: string
   score: number
+  confidence?: 'high' | 'medium' | 'low' | null
   reasons: string[]
   warnings: string[]
   score_breakdown: ScoreBreakdown[]
@@ -66,11 +68,20 @@ export type CompatibilityIssue = {
   positions: string[]
 }
 
+export type DuplicateInfo = {
+  is_duplicate: boolean
+  project_id?: number | null
+  project_name?: string | null
+  created_at?: string | null
+  total_positions?: number | null
+}
+
 export type ParseResponse = {
   positions: LVPosition[]
   total_positions: number
   billable_positions: number
   service_positions: number
+  duplicate?: DuplicateInfo | null
 }
 
 export type SuggestionResponse = {
@@ -104,3 +115,20 @@ export type ProductSearchResult = {
 }
 
 export type AnalysisStep = 'idle' | 'uploading' | 'parsing' | 'enriching' | 'matching' | 'done' | 'error'
+
+export type AppView = 'analysis' | 'archive'
+
+export type ProjectSummary = {
+  id: number
+  filename: string | null
+  project_name: string | null
+  total_positions: number
+  billable_positions: number
+  service_positions: number
+  created_at: string
+}
+
+export type ProjectDetailResponse = {
+  project: ProjectSummary
+  positions: LVPosition[]
+}
