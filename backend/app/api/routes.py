@@ -264,9 +264,9 @@ def _build_offer_lines(
     lines: list[OfferLine] = []
     warnings: list[ExportWarning] = []
 
-    # Check for positions without article assignment
+    # Check for material positions without article assignment (skip Dienstleistungen)
     for position in request.positions:
-        if position.id not in request.selected_article_ids:
+        if position.id not in request.selected_article_ids and position.position_type != "dienstleistung":
             warnings.append(ExportWarning(
                 position_id=position.id,
                 ordnungszahl=position.ordnungszahl,

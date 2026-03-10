@@ -361,11 +361,11 @@ def _load_class_score(required: str | None, product: Product) -> tuple[float, li
         return 0.0, []
 
     if product_rank < required_rank:
-        return -20.0, [f"Belastungsklasse {product_class} unter {required}"]
+        return -25.0, [f"Belastungsklasse {product_class} unter {required}"]
     if product_rank == required_rank:
-        return 14.0, [f"Belastungsklasse {product_class} passend"]
+        return 18.0, [f"Belastungsklasse {product_class} passend"]
 
-    return 10.0, [f"Belastungsklasse {product_class} ueber Anforderung"]
+    return 12.0, [f"Belastungsklasse {product_class} über Anforderung"]
 
 
 def _material_score(required_material: str | None, product: Product) -> tuple[float, list[str]]:
@@ -391,9 +391,39 @@ def _norm_score(required_norm: str | None, product: Product) -> tuple[float, lis
 
     required = _normalize(required_norm)
     product_norm = _normalize(product.norm_primaer)
+
+    if not product_norm:
+        return 0.0, []
+
     if required and required in product_norm:
-        return 8.0, [f"Norm passt ({product.norm_primaer})"]
-    return 0.0, []
+        return 12.0, [f"Norm passt ({product.norm_primaer})"]
+
+    # Norm explicitly specified but product has a different norm
+    return -15.0, [f"Norm abweichend ({product.norm_primaer} ≠ {required_norm})"]
+
+
+def _sn_score(required_sn: int | None, product: Product) -> tuple[float, list[str]]:
+    if required_sn is None:
+        return 0.0, []
+
+    product_sn_str = (product.steifigkeitsklasse_sn or "").strip()
+    if not product_sn_str:
+        return 0.0, []
+
+    # Extract numeric SN value (e.g. "SN8" -> 8, "8" -> 8)
+    sn_match = re.search(r"(\d+)", product_sn_str)
+    if not sn_match:
+        return 0.0, []
+
+    product_sn = int(sn_match.group(1))
+
+    if product_sn == required_sn:
+        return 18.0, [f"SN{required_sn} exakt"]
+    if product_sn > required_sn:
+        return 10.0, [f"SN{product_sn} über Anforderung (SN{required_sn})"]
+
+    # Product SN too low — hard penalty, safety-critical
+    return -30.0, [f"SN{product_sn} unter Anforderung (SN{required_sn})"]
 
 
 def load_active_products(db: Session) -> list[Product]:
@@ -464,16 +494,18 @@ def suggest_products_for_position(
         load_sc, load_reasons = _load_class_score(position.parameters.load_class, product)
         material_sc, material_reasons = _material_score(position.parameters.material, product)
         norm_sc, norm_reasons = _norm_score(position.parameters.norm, product)
+        sn_sc, sn_reasons = _sn_score(position.parameters.stiffness_class_sn, product)
         text_sc = _text_similarity_score(position_tokens, product)
         ptype_sc, ptype_reasons = _product_type_score(position_product_type, product)
 
-        score += category_score + dn_sc + load_sc + material_sc + norm_sc + text_sc + ptype_sc
+        score += category_score + dn_sc + load_sc + material_sc + norm_sc + sn_sc + text_sc + ptype_sc
 
         reasons.extend(category_reasons)
         reasons.extend(dn_reasons)
         reasons.extend(load_reasons)
         reasons.extend(material_reasons)
         reasons.extend(norm_reasons)
+        reasons.extend(sn_reasons)
         reasons.extend(ptype_reasons)
 
         breakdown.append(ScoreBreakdown(component="Kategorie", points=round(category_score, 1), detail="; ".join(category_reasons) or "-"))
@@ -482,6 +514,7 @@ def suggest_products_for_position(
         breakdown.append(ScoreBreakdown(component="Belastungsklasse", points=round(load_sc, 1), detail="; ".join(load_reasons) or "-"))
         breakdown.append(ScoreBreakdown(component="Werkstoff", points=round(material_sc, 1), detail="; ".join(material_reasons) or "-"))
         breakdown.append(ScoreBreakdown(component="Norm", points=round(norm_sc, 1), detail="; ".join(norm_reasons) or "-"))
+        breakdown.append(ScoreBreakdown(component="SN-Klasse", points=round(sn_sc, 1), detail="; ".join(sn_reasons) or "-"))
         breakdown.append(ScoreBreakdown(component="Textähnlichkeit", points=round(text_sc, 1), detail="-"))
 
         stock = product.lager_gesamt or 0
@@ -554,6 +587,7 @@ def suggest_products_for_position(
                 category=product.kategorie,
                 subcategory=product.unterkategorie,
                 dn=product.nennweite_dn,
+                sn=int(re.search(r"(\d+)", product.steifigkeitsklasse_sn).group(1)) if product.steifigkeitsklasse_sn and re.search(r"(\d+)", product.steifigkeitsklasse_sn) else None,
                 load_class=product.belastungsklasse,
                 norm=product.norm_primaer,
                 stock=product.lager_gesamt,

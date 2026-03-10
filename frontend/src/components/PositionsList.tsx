@@ -212,6 +212,15 @@ export function PositionsList({
                   {position.parameters.material && (
                     <span className="meta-tag">{position.parameters.material}</span>
                   )}
+                  {position.parameters.norm && (
+                    <span className="meta-tag">{position.parameters.norm}</span>
+                  )}
+                  {position.parameters.stiffness_class_sn != null && (
+                    <span className="meta-tag">SN{position.parameters.stiffness_class_sn}</span>
+                  )}
+                  {position.parameters.installation_area && (
+                    <span className="meta-tag">{position.parameters.installation_area}</span>
+                  )}
                 </div>
               </button>
               <button

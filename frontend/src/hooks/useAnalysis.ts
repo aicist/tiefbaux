@@ -277,6 +277,7 @@ export function useAnalysis() {
   }, [positions, selectedArticleIds, selectedCount, customerName, projectName, skippedPositionIds])
 
   const handleExportConfirm = useCallback(async () => {
+    if (isExporting) return
     setShowExportDialog(false)
     setIsExporting(true)
     setErrorText(null)
@@ -302,7 +303,7 @@ export function useAnalysis() {
     } finally {
       setIsExporting(false)
     }
-  }, [positions, selectedArticleIds, customerName, projectName, skippedPositionIds])
+  }, [positions, selectedArticleIds, customerName, projectName, skippedPositionIds, isExporting])
 
   const handleExportCancel = useCallback(() => {
     setShowExportDialog(false)

@@ -1073,6 +1073,33 @@ body {
   flex-shrink: 0;
 }
 
+.param-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.param-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.5;
+}
+.param-match {
+  background: #dcfce7;
+  color: #166534;
+}
+.param-mismatch {
+  background: #fee2e2;
+  color: #991b1b;
+}
+.param-neutral {
+  background: #f1f5f9;
+  color: var(--ink-700);
+}
+
 .suggestion-price-row {
   display: flex;
   justify-content: space-between;
@@ -1154,6 +1181,10 @@ body {
   background: var(--accent-light);
   color: var(--accent-text);
   font-weight: 500;
+}
+.reason-chip.reason-negative {
+  background: #fee2e2;
+  color: #991b1b;
 }
 
 /* ─── No Match Info ─── */
@@ -1605,6 +1636,7 @@ body {
 .breakdown-row.row-neutral { background: #fefce8; }
 .breakdown-points.positive { color: var(--accent); }
 .breakdown-points.negative { color: #dc2626; }
+.breakdown-points.zero { color: var(--ink-500); }
 .breakdown-detail {
   color: var(--ink-500);
   font-size: 0.7rem;

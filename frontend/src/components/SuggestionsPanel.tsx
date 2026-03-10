@@ -3,6 +3,28 @@ import type { CompatibilityIssue, LVPosition, ProductSearchResult, ProductSugges
 import { ParameterEditor } from './ParameterEditor'
 import { ProductSearchModal } from './ProductSearchModal'
 
+const PARAM_STYLES: Record<string, React.CSSProperties> = {
+  match: { background: '#dcfce7', color: '#166534' },
+  mismatch: { background: '#fee2e2', color: '#991b1b' },
+  neutral: { background: '#f1f5f9', color: '#334155' },
+}
+
+function ParamBadge({ label, status }: { label: string; status: 'match' | 'mismatch' | 'neutral' }) {
+  return (
+    <span
+      className={`param-badge param-${status}`}
+      style={{ ...PARAM_STYLES[status], padding: '1px 7px', borderRadius: '4px', fontSize: '0.7rem', fontWeight: 600 }}
+    >
+      {label}
+    </span>
+  )
+}
+
+function extractSnFromText(text: string): number | null {
+  const match = text.match(/SN\s*(\d+)/i)
+  return match ? parseInt(match[1], 10) : null
+}
+
 type Props = {
   activePosition: LVPosition | null
   suggestions: ProductSuggestion[]
@@ -150,7 +172,7 @@ export function SuggestionsPanel({
                             {suggestion.score_breakdown.map((b) => (
                               <div key={b.component} className={`breakdown-row ${b.points > 0 ? 'row-positive' : b.points < 0 ? 'row-negative' : 'row-neutral'}`}>
                                 <span className="breakdown-component">{b.component}</span>
-                                <span className={`breakdown-points ${b.points >= 0 ? 'positive' : 'negative'}`}>
+                                <span className={`breakdown-points ${b.points > 0 ? 'positive' : b.points < 0 ? 'negative' : 'zero'}`}>
                                   {b.points > 0 ? '+' : ''}{b.points}
                                 </span>
                                 <span className="breakdown-detail">{b.detail}</span>
@@ -166,12 +188,35 @@ export function SuggestionsPanel({
                     <span>{suggestion.artikel_id}</span>
                     <span className="meta-sep" />
                     <span>{suggestion.hersteller ?? 'Unbekannt'}</span>
-                    {suggestion.dn && (
-                      <>
-                        <span className="meta-sep" />
-                        <span>DN {suggestion.dn}</span>
-                      </>
-                    )}
+                  </div>
+
+                  <div className="param-badges">
+                    {suggestion.dn != null && (() => {
+                      const text = `${activePosition?.description ?? ''} ${activePosition?.raw_text ?? ''}`
+                      const dnMatch = text.match(/DN\s*(\d+)/i)
+                      const reqDn = activePosition?.parameters.nominal_diameter_dn ?? (dnMatch ? parseInt(dnMatch[1], 10) : null)
+                      return <ParamBadge
+                        label={`DN ${suggestion.dn}`}
+                        status={reqDn == null ? 'neutral' : reqDn === suggestion.dn ? 'match' : 'mismatch'}
+                      />
+                    })()}
+                    {suggestion.sn != null && (() => {
+                      const reqSn = activePosition?.parameters.stiffness_class_sn
+                        ?? extractSnFromText(activePosition?.description ?? '')
+                        ?? extractSnFromText(activePosition?.raw_text ?? '')
+                      return <ParamBadge
+                        label={`SN${suggestion.sn}`}
+                        status={reqSn == null ? 'neutral' : suggestion.sn! >= reqSn ? 'match' : 'mismatch'}
+                      />
+                    })()}
+                    {suggestion.load_class && <ParamBadge
+                      label={suggestion.load_class}
+                      status={!activePosition?.parameters.load_class ? 'neutral' : activePosition.parameters.load_class.toUpperCase() === suggestion.load_class.toUpperCase() ? 'match' : 'mismatch'}
+                    />}
+                    {suggestion.norm && <ParamBadge
+                      label={suggestion.norm}
+                      status={!activePosition?.parameters.norm ? 'neutral' : suggestion.norm.toLowerCase().includes(activePosition.parameters.norm.toLowerCase()) ? 'match' : 'mismatch'}
+                    />}
                   </div>
 
                   <div className="suggestion-price-row">
@@ -207,9 +252,12 @@ export function SuggestionsPanel({
 
                   {suggestion.reasons.length > 0 && !suggestion.is_manual && (
                     <div className="reason-chips">
-                      {suggestion.reasons.map((reason) => (
-                        <span key={reason} className="reason-chip">{reason}</span>
-                      ))}
+                      {suggestion.reasons.map((reason) => {
+                        const isNegative = reason.includes('abweichend') || reason.includes('weicht ab') || reason.includes('unter ') || reason.includes('≠')
+                        return (
+                          <span key={reason} className={`reason-chip ${isNegative ? 'reason-negative' : ''}`}>{reason}</span>
+                        )
+                      })}
                     </div>
                   )}
                 </div>

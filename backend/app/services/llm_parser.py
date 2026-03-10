@@ -33,11 +33,13 @@ SYSTEM_INSTRUCTION = (
     "(Rohre, Schachtteile, Abdeckungen, Formstücke, Rinnen, Dichtungen, Geotextilien, Vlies, "
     "Kies, Sand zum Einbau etc.)\n"
     "- 'dienstleistung': Reine Arbeitsleistungen OHNE Materialbedarf aus dem Baustoffhandel: "
-    "Abbruch, Demontage, Rueckbau, Erdarbeiten (Aushub, Verfuellung, Verdichtung, Planum), "
+    "Abbruch, Demontage, Rueckbau, Erdarbeiten (Aushub, Grabenaushub, Grabentiefe, "
+    "Verfuellung, Verdichtung, Planum, Boden loesen, Boden einbauen, Bodenabfuhr), "
     "Transport, Entsorgung, Baustelleneinrichtung, Vermessung, Verkehrssicherung, "
     "Wasserhaltung, Stundenlohnarbeiten, Vorhaltung, Sperrung, Druckprobe, Absicherung, "
     "Roden, Aufnehmen und Entsorgen von Bestandsmaterial (Pflaster, Asphalt, Bordsteine, "
-    "Zaeune, Tore, Leuchten etc.), Ausbauen bestehender Leitungen/Schaechte\n"
+    "Zaeune, Tore, Leuchten etc.), Ausbauen bestehender Leitungen/Schaechte, "
+    "Oberflaeche wiederherstellen, Asphalt einbauen, Pflaster verlegen (ohne Materiallieferung)\n"
     "- WICHTIG: 'aufnehmen und entsorgen', 'ausbauen und entsorgen', 'abbrechen', 'demontieren', "
     "'rueckbauen', 'roden', 'entfernen' = IMMER 'dienstleistung', auch wenn technische Begriffe "
     "wie DN oder Schacht vorkommen!\n"
@@ -58,7 +60,7 @@ SYSTEM_INSTRUCTION = (
     "h, Std, StD, lfm, lfdm, lfd.m, Psch, psch, Pausch, Wo, mWo, cbm, etc.\n\n"
     "Gib ein JSON-Array zurueck. Jedes Objekt hat diese Felder:\n"
     "- ordnungszahl: string (z.B. '1.5.3')\n"
-    "- description: string (Kurzbeschreibung der Position, max 120 Zeichen)\n"
+    "- description: string (Beschreibung der Position mit allen technischen Details wie Norm, SN-Klasse, DN, Material, Belastungsklasse — max 200 Zeichen)\n"
     "- quantity: number | null\n"
     "- unit: string | null\n"
     "- position_type: 'material' | 'dienstleistung'\n"
@@ -72,7 +74,8 @@ SYSTEM_INSTRUCTION = (
     "- material: string | null (PP, PVC-U, Stahlbeton, Beton, Gusseisen, HDPE, PE, PE 100, PE 100-RC, Steinzeug)\n"
     "- nominal_diameter_dn: integer | null\n"
     "- load_class: string | null (A15, B125, C250, D400, E600, F900)\n"
-    "- norm: string | null\n"
+    "- norm: string | null (z.B. 'DIN EN 1401', 'DIN EN 13476', 'DIN EN 1916')\n"
+    "- stiffness_class_sn: integer | null (Ringsteifigkeitsklasse, z.B. 4, 8, 16 bei SN4, SN8, SN16)\n"
     "- reference_product: string | null\n"
     "- installation_area: string | null (Fahrbahn, Gehweg, Erdeinbau)\n"
     "- sortiment_relevant: boolean (true wenn ein Tiefbau-Baustoffhaendler dieses Produkt "
@@ -218,6 +221,7 @@ def _assemble_position(idx: int, raw: dict[str, Any]) -> LVPosition:
         unit=unit,
         reference_product=raw.get("reference_product"),
         installation_area=raw.get("installation_area"),
+        stiffness_class_sn=raw.get("stiffness_class_sn"),
         sortiment_relevant=raw.get("sortiment_relevant"),
     )
 

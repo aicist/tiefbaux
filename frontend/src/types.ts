@@ -11,6 +11,7 @@ export type TechnicalParameters = {
   unit?: string | null
   reference_product?: string | null
   installation_area?: string | null
+  stiffness_class_sn?: number | null
   sortiment_relevant?: boolean | null
 }
 
@@ -39,6 +40,7 @@ export type ProductSuggestion = {
   category?: string | null
   subcategory?: string | null
   dn?: number | null
+  sn?: number | null
   load_class?: string | null
   norm?: string | null
   stock?: number | null

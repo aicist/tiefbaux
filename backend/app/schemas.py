@@ -21,6 +21,7 @@ class TechnicalParameters(BaseModel):
     unit: str | None = None
     reference_product: str | None = None
     installation_area: str | None = None
+    stiffness_class_sn: int | None = None
     sortiment_relevant: bool | None = None
 
 
@@ -67,6 +68,7 @@ class ProductSuggestion(BaseModel):
     category: str | None = None
     subcategory: str | None = None
     dn: int | None = None
+    sn: int | None = None
     load_class: str | None = None
     norm: str | None = None
     stock: int | None = None
