@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 from datetime import datetime
-from itertools import groupby
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -60,7 +59,7 @@ class NumberedCanvas(canvas.Canvas):
 
     def showPage(self):
         self._saved_page_states.append(dict(self.__dict__))
-        super().showPage()
+        self._startPage()
 
     def save(self):
         num_pages = len(self._saved_page_states)
@@ -209,15 +208,6 @@ def _make_styles() -> dict[str, ParagraphStyle]:
     }
 
 
-# ── Section grouping ───────────────────────────────────────────────
-def _section_key(oz: str) -> str:
-    """Extract section prefix from ordnungszahl for grouping."""
-    parts = oz.replace(".", " ").split()
-    if len(parts) >= 2:
-        return f"{parts[0]}.{parts[1]}"
-    return parts[0] if parts else oz
-
-
 # ── Main PDF builder ───────────────────────────────────────────────
 def build_offer_pdf(lines: list[OfferLine], metadata: ExportOfferMetadata) -> bytes:
     buffer = io.BytesIO()
@@ -289,7 +279,7 @@ def build_offer_pdf(lines: list[OfferLine], metadata: ExportOfferMetadata) -> by
     )
     story.append(Spacer(1, 6 * mm))
 
-    # ── Table with section grouping ───
+    # ── Table with LV positions only ───
     col_widths = [16 * mm, 52 * mm, 48 * mm, 18 * mm, 18 * mm, 22 * mm]
     header_data = ["Pos.", "Beschreibung", "Artikel", "Menge", "EP (€)", "Gesamt (€)"]
 
@@ -313,55 +303,25 @@ def build_offer_pdf(lines: list[OfferLine], metadata: ExportOfferMetadata) -> by
     ]
 
     row_idx = 1
-    sorted_lines = sorted(lines, key=lambda l: l.ordnungszahl)
+    for line in lines:
+        desc_text = line.description[:120]
+        artikel_text = f"{line.artikelname}"
+        if line.hersteller:
+            artikel_text += f"<br/><font size='6' color='#64748B'>{line.hersteller}</font>"
+        artikel_text += f"<br/><font size='6' color='#94A3B8'>{line.artikel_id}</font>"
 
-    for section_key, group in groupby(sorted_lines, key=lambda l: _section_key(l.ordnungszahl)):
-        group_lines = list(group)
-
-        # Section header row
         table_data.append([
-            Paragraph(f"<b>{section_key}</b>", styles["section_header"]),
-            "", "", "", "", "",
+            line.ordnungszahl,
+            Paragraph(desc_text, styles["body"]),
+            Paragraph(artikel_text, styles["body"]),
+            f"{_fmt_qty(line.quantity)} {line.unit}",
+            _fmt_money(line.price_net),
+            _fmt_money(line.total_net),
         ])
-        table_styles_list.append(("BACKGROUND", (0, row_idx), (-1, row_idx), colors.HexColor("#EEF2F6")))
-        table_styles_list.append(("SPAN", (0, row_idx), (1, row_idx)))
-        table_styles_list.append(("LINEBELOW", (0, row_idx), (-1, row_idx), 0.5, GRAY_200))
-        row_idx += 1
-
-        section_total = 0.0
-        for line in group_lines:
-            desc_text = line.description[:120]
-            artikel_text = f"{line.artikelname}"
-            if line.hersteller:
-                artikel_text += f"<br/><font size='6' color='#64748B'>{line.hersteller}</font>"
-            artikel_text += f"<br/><font size='6' color='#94A3B8'>{line.artikel_id}</font>"
-
-            table_data.append([
-                line.ordnungszahl,
-                Paragraph(desc_text, styles["body"]),
-                Paragraph(artikel_text, styles["body"]),
-                f"{_fmt_qty(line.quantity)} {line.unit}",
-                _fmt_money(line.price_net),
-                _fmt_money(line.total_net),
-            ])
-            # Alternating row background
-            if (row_idx - 1) % 2 == 0:
-                table_styles_list.append(("BACKGROUND", (0, row_idx), (-1, row_idx), ROW_ALT))
-            # Right-align numeric columns
-            table_styles_list.append(("ALIGN", (3, row_idx), (-1, row_idx), "RIGHT"))
-            # Thin bottom border
-            table_styles_list.append(("LINEBELOW", (0, row_idx), (-1, row_idx), 0.25, GRAY_200))
-            row_idx += 1
-            section_total += line.total_net
-
-        # Section subtotal row
-        table_data.append([
-            "", "", "", "",
-            Paragraph("<b>Zwischensumme</b>", styles["body_small"]),
-            Paragraph(f"<b>{_fmt_money(section_total)}</b>", styles["body"]),
-        ])
-        table_styles_list.append(("ALIGN", (4, row_idx), (-1, row_idx), "RIGHT"))
-        table_styles_list.append(("LINEBELOW", (0, row_idx), (-1, row_idx), 0.75, GRAY_400))
+        if (row_idx - 1) % 2 == 0:
+            table_styles_list.append(("BACKGROUND", (0, row_idx), (-1, row_idx), ROW_ALT))
+        table_styles_list.append(("ALIGN", (3, row_idx), (-1, row_idx), "RIGHT"))
+        table_styles_list.append(("LINEBELOW", (0, row_idx), (-1, row_idx), 0.25, GRAY_200))
         row_idx += 1
 
     table = Table(table_data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")

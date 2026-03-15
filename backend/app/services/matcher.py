@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections import Counter
@@ -7,7 +8,7 @@ from collections import Counter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import Product
+from ..models import ManualOverride, Product
 from ..schemas import LVPosition, ProductSuggestion, ScoreBreakdown
 
 LOAD_RANK = {
@@ -426,6 +427,61 @@ def _sn_score(required_sn: int | None, product: Product) -> tuple[float, list[st
     return -30.0, [f"SN{product_sn} unter Anforderung (SN{required_sn})"]
 
 
+def _parse_dimensions(dim_str: str | None) -> tuple[int, ...]:
+    """Extract numeric dimensions from a string like '300/500', '500x500', '300x300mm'."""
+    if not dim_str:
+        return ()
+    nums = re.findall(r"(\d+)", dim_str)
+    return tuple(sorted(int(n) for n in nums))
+
+
+def _dimensions_score(required_dims: str | None, product: Product) -> tuple[float, list[str]]:
+    """Score based on dimension match (e.g. aufsatz frame size 300x500)."""
+    req = _parse_dimensions(required_dims)
+    if not req:
+        return 0.0, []
+
+    # Check product name and description for matching dimensions
+    product_text = f"{product.artikelname or ''} {product.artikelbeschreibung or ''}"
+    prod_dims = _parse_dimensions(product_text)
+
+    if not prod_dims:
+        # Also try laenge/breite from product columns
+        col_dims = tuple(sorted(
+            d for d in [product.laenge_mm, product.breite_mm] if d and d > 0
+        ))
+        if col_dims:
+            prod_dims = col_dims
+
+    if not prod_dims:
+        return 0.0, []
+
+    if req == prod_dims:
+        return 15.0, [f"Abmessungen {required_dims} exakt"]
+    # Check if at least the key dimensions overlap
+    if set(req) & set(prod_dims):
+        return 5.0, [f"Abmessungen teilweise passend ({required_dims})"]
+    return -10.0, [f"Abmessungen abweichend: gefordert {required_dims}"]
+
+
+def _description_hash(description: str) -> str:
+    """Hash the normalized description for override matching."""
+    normalized = re.sub(r"\s+", " ", description.strip().lower())
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def _find_overrides(db: Session, position: LVPosition) -> list[ManualOverride]:
+    """Find manual overrides matching this position."""
+    desc_hash = _description_hash(position.description)
+    overrides = list(db.scalars(
+        select(ManualOverride)
+        .where(ManualOverride.description_hash == desc_hash)
+        .order_by(ManualOverride.override_count.desc())
+        .limit(3)
+    ))
+    return overrides
+
+
 def load_active_products(db: Session) -> list[Product]:
     """Load all active products once. Pass the result to suggest_products_for_position."""
     return list(db.scalars(select(Product).where(Product.status == "aktiv")))
@@ -497,8 +553,9 @@ def suggest_products_for_position(
         sn_sc, sn_reasons = _sn_score(position.parameters.stiffness_class_sn, product)
         text_sc = _text_similarity_score(position_tokens, product)
         ptype_sc, ptype_reasons = _product_type_score(position_product_type, product)
+        dims_sc, dims_reasons = _dimensions_score(position.parameters.dimensions, product)
 
-        score += category_score + dn_sc + load_sc + material_sc + norm_sc + sn_sc + text_sc + ptype_sc
+        score += category_score + dn_sc + load_sc + material_sc + norm_sc + sn_sc + text_sc + ptype_sc + dims_sc
 
         reasons.extend(category_reasons)
         reasons.extend(dn_reasons)
@@ -507,6 +564,7 @@ def suggest_products_for_position(
         reasons.extend(norm_reasons)
         reasons.extend(sn_reasons)
         reasons.extend(ptype_reasons)
+        reasons.extend(dims_reasons)
 
         breakdown.append(ScoreBreakdown(component="Kategorie", points=round(category_score, 1), detail="; ".join(category_reasons) or "-"))
         breakdown.append(ScoreBreakdown(component="Produkttyp", points=round(ptype_sc, 1), detail="; ".join(ptype_reasons) or "-"))
@@ -515,6 +573,8 @@ def suggest_products_for_position(
         breakdown.append(ScoreBreakdown(component="Werkstoff", points=round(material_sc, 1), detail="; ".join(material_reasons) or "-"))
         breakdown.append(ScoreBreakdown(component="Norm", points=round(norm_sc, 1), detail="; ".join(norm_reasons) or "-"))
         breakdown.append(ScoreBreakdown(component="SN-Klasse", points=round(sn_sc, 1), detail="; ".join(sn_reasons) or "-"))
+        if dims_sc != 0:
+            breakdown.append(ScoreBreakdown(component="Abmessungen", points=round(dims_sc, 1), detail="; ".join(dims_reasons) or "-"))
         breakdown.append(ScoreBreakdown(component="Textähnlichkeit", points=round(text_sc, 1), detail="-"))
 
         stock = product.lager_gesamt or 0
@@ -555,13 +615,51 @@ def suggest_products_for_position(
         if existing is None or s > existing[0]:
             grouped_by_id[key] = entry
 
-    min_score = 35.0 if category else 40.0
+    min_score = 35.0 if category else 45.0
     final_candidates = [
         entry for entry in sorted(grouped_by_id.values(), key=lambda item: item[0], reverse=True) if entry[0] >= min_score
     ][:limit]
 
+    # Feature 6: Inject manual override suggestions
+    override_suggestions: list[ProductSuggestion] = []
+    overrides = _find_overrides(db, position)
+    existing_ids = {entry[1].artikel_id for entry in final_candidates} if final_candidates else set()
+    for ov in overrides:
+        if ov.chosen_artikel_id in existing_ids:
+            continue
+        ov_product = db.scalar(select(Product).where(Product.artikel_id == ov.chosen_artikel_id))
+        if not ov_product or ov_product.status != "aktiv":
+            continue
+        unit_price = _price_for_quantity(ov_product, quantity)
+        total_price = round((unit_price or 0.0) * quantity, 2) if unit_price is not None else None
+        sn_val = None
+        if ov_product.steifigkeitsklasse_sn and re.search(r"(\d+)", ov_product.steifigkeitsklasse_sn):
+            sn_val = int(re.search(r"(\d+)", ov_product.steifigkeitsklasse_sn).group(1))
+        override_suggestions.append(ProductSuggestion(
+            artikel_id=ov_product.artikel_id,
+            artikelname=ov_product.artikelname,
+            hersteller=ov_product.hersteller,
+            category=ov_product.kategorie,
+            subcategory=ov_product.unterkategorie,
+            dn=ov_product.nennweite_dn,
+            sn=sn_val,
+            load_class=ov_product.belastungsklasse,
+            norm=ov_product.norm_primaer,
+            stock=ov_product.lager_gesamt,
+            delivery_days=ov_product.lieferant_1_lieferzeit_tage,
+            price_net=unit_price,
+            total_net=total_price,
+            currency=ov_product.waehrung or "EUR",
+            score=0,
+            reasons=[f"Häufig gewählt ({ov.override_count}x)"],
+            warnings=[],
+            score_breakdown=[],
+            is_override=True,
+        ))
+        existing_ids.add(ov_product.artikel_id)
+
     if not final_candidates:
-        return []
+        return override_suggestions
 
     suggestions: list[ProductSuggestion] = []
     for s, product, reasons, breakdown in final_candidates:
@@ -602,4 +700,6 @@ def suggest_products_for_position(
             )
         )
 
+    # Append override suggestions after regular ones
+    suggestions.extend(override_suggestions)
     return suggestions

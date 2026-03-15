@@ -85,6 +85,7 @@ export async function fetchExportPreview(
   selectedArticleIds: Record<string, string>,
   customerName: string,
   projectName: string,
+  customUnitPrices?: Record<string, number>,
 ): Promise<ExportPreviewResponse> {
   const response = await wrapFetch(
     fetch(`${API_BASE}/export-preview`, {
@@ -95,6 +96,7 @@ export async function fetchExportPreview(
         selected_article_ids: selectedArticleIds,
         customer_name: customerName,
         project_name: projectName,
+        custom_unit_prices: customUnitPrices,
       }),
     }),
   )
@@ -106,6 +108,7 @@ export async function exportOffer(
   selectedArticleIds: Record<string, string>,
   customerName: string,
   projectName: string,
+  customUnitPrices?: Record<string, number>,
 ): Promise<Blob> {
   const response = await wrapFetch(
     fetch(`${API_BASE}/export-offer`, {
@@ -116,6 +119,7 @@ export async function exportOffer(
         selected_article_ids: selectedArticleIds,
         customer_name: customerName,
         project_name: projectName,
+        custom_unit_prices: customUnitPrices,
       }),
     }),
   )
@@ -167,8 +171,9 @@ export async function checkCompatibility(
   return handleResponse<CompatibilityIssue[]>(response)
 }
 
-export async function fetchProjects(): Promise<ProjectSummary[]> {
-  const response = await wrapFetch(fetch(`${API_BASE}/projects`))
+export async function fetchProjects(q?: string): Promise<ProjectSummary[]> {
+  const params = q ? `?q=${encodeURIComponent(q)}` : ''
+  const response = await wrapFetch(fetch(`${API_BASE}/projects${params}`))
   return handleResponse<ProjectSummary[]>(response)
 }
 
@@ -184,4 +189,35 @@ export async function deleteProject(projectId: number): Promise<void> {
   if (!response.ok) {
     await handleResponse(response)
   }
+}
+
+export async function saveSelections(projectId: number, selectedArticleIds: Record<string, string>): Promise<void> {
+  await wrapFetch(
+    fetch(`${API_BASE}/projects/save-selections`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: projectId, selected_article_ids: selectedArticleIds }),
+    }),
+  )
+}
+
+export async function recordOverride(data: {
+  position_description: string
+  ordnungszahl?: string
+  category?: string | null
+  dn?: number | null
+  material?: string | null
+  chosen_artikel_id: string
+}): Promise<void> {
+  await wrapFetch(
+    fetch(`${API_BASE}/overrides`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+  )
+}
+
+export function getProjectPdfUrl(projectId: number): string {
+  return `${API_BASE}/projects/${projectId}/pdf`
 }

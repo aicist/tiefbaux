@@ -7,6 +7,7 @@ type Props = {
   onAnalyze: () => void
   onExport: () => void
   onReset: () => void
+  onTogglePdfViewer: () => void
   customerName: string
   onCustomerNameChange: (value: string) => void
   projectName: string
@@ -15,6 +16,10 @@ type Props = {
   isExporting: boolean
   selectedCount: number
   errorText: string | null
+  canShowPdf: boolean
+  isPdfViewerOpen: boolean
+  metadataCustomerName?: string | null
+  metadataProjectName?: string | null
 }
 
 function formatSize(bytes: number): string {
@@ -29,6 +34,7 @@ export function UploadPanel({
   onAnalyze,
   onExport,
   onReset,
+  onTogglePdfViewer,
   customerName,
   onCustomerNameChange,
   projectName,
@@ -37,6 +43,10 @@ export function UploadPanel({
   isExporting,
   selectedCount,
   errorText,
+  canShowPdf,
+  isPdfViewerOpen,
+  metadataCustomerName,
+  metadataProjectName,
 }: Props) {
   const [isDragOver, setIsDragOver] = useState(false)
   const isAnalyzing = step !== 'idle' && step !== 'done' && step !== 'error'
@@ -119,14 +129,30 @@ export function UploadPanel({
         </button>
       )}
 
+      {canShowPdf && (
+        <button type="button" className="btn btn-ghost" onClick={onTogglePdfViewer}>
+          {isPdfViewerOpen ? 'Original schließen' : 'Original anzeigen'}
+        </button>
+      )}
+
       <div className="form-section">
         <h3>Angebotsdaten</h3>
         <label className="form-field">
-          <span>Kunde</span>
+          <span>
+            Kunde
+            {metadataCustomerName && customerName === metadataCustomerName && (
+              <span className="auto-detected-hint">(automatisch erkannt)</span>
+            )}
+          </span>
           <input type="text" value={customerName} onChange={(e) => onCustomerNameChange(e.target.value)} placeholder="Kundenname" />
         </label>
         <label className="form-field">
-          <span>Projekt</span>
+          <span>
+            Projekt
+            {metadataProjectName && projectName === metadataProjectName && (
+              <span className="auto-detected-hint">(automatisch erkannt)</span>
+            )}
+          </span>
           <input type="text" value={projectName} onChange={(e) => onProjectNameChange(e.target.value)} placeholder="Projektname" />
         </label>
       </div>

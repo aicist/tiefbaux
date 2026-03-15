@@ -37,6 +37,7 @@ class LVPosition(BaseModel):
     billable: bool = True
     position_type: Literal["material", "dienstleistung"] | None = None
     parameters: TechnicalParameters = Field(default_factory=TechnicalParameters)
+    source_page: int | None = None
 
 
 class DuplicateInfo(BaseModel):
@@ -47,12 +48,22 @@ class DuplicateInfo(BaseModel):
     total_positions: int | None = None
 
 
+class ProjectMetadata(BaseModel):
+    bauvorhaben: str | None = None
+    objekt_nr: str | None = None
+    submission_date: str | None = None
+    auftraggeber: str | None = None
+    kunde_name: str | None = None
+    kunde_adresse: str | None = None
+
+
 class ParseLVResponse(BaseModel):
     positions: list[LVPosition]
     total_positions: int
     billable_positions: int
     service_positions: int = 0
     duplicate: DuplicateInfo | None = None
+    metadata: ProjectMetadata | None = None
 
 
 class ScoreBreakdown(BaseModel):
@@ -81,6 +92,7 @@ class ProductSuggestion(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     score_breakdown: list[ScoreBreakdown] = Field(default_factory=list)
+    is_override: bool = False
 
 
 class PositionSuggestions(BaseModel):
@@ -109,6 +121,7 @@ class SuggestionsResponse(BaseModel):
 class ExportOfferRequest(BaseModel):
     positions: list[LVPosition]
     selected_article_ids: dict[str, str]
+    custom_unit_prices: dict[str, float] = Field(default_factory=dict)
     customer_name: str | None = None
     customer_address: str | None = None
     project_name: str | None = None
@@ -176,8 +189,28 @@ class ProjectSummary(BaseModel):
     billable_positions: int
     service_positions: int
     created_at: datetime
+    bauvorhaben: str | None = None
+    objekt_nr: str | None = None
+    submission_date: str | None = None
+    kunde_name: str | None = None
 
 
 class ProjectDetailResponse(BaseModel):
     project: ProjectSummary
     positions: list[LVPosition]
+    metadata: ProjectMetadata | None = None
+    selections: dict[str, str] | None = None
+
+
+class SaveSelectionsRequest(BaseModel):
+    project_id: int
+    selected_article_ids: dict[str, str]
+
+
+class OverrideRequest(BaseModel):
+    position_description: str
+    ordnungszahl: str | None = None
+    category: str | None = None
+    dn: int | None = None
+    material: str | None = None
+    chosen_artikel_id: str

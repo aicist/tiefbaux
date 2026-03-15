@@ -19,6 +19,7 @@ dist/
 
 # PDFs (test data & catalogs)
 *.pdf
+backend/uploads/
 
 # IDE
 .vscode/

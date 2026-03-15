@@ -12,7 +12,7 @@ import httpx
 import pdfplumber
 
 from ..config import settings
-from ..schemas import LVPosition, TechnicalParameters
+from ..schemas import LVPosition, ProjectMetadata, TechnicalParameters
 from .ai_interpreter import InterpretationError, _infer_with_heuristics, _normalize_json_array
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,8 @@ SYSTEM_INSTRUCTION = (
     "- load_class: string | null (A15, B125, C250, D400, E600, F900)\n"
     "- norm: string | null (z.B. 'DIN EN 1401', 'DIN EN 13476', 'DIN EN 1916')\n"
     "- stiffness_class_sn: integer | null (Ringsteifigkeitsklasse, z.B. 4, 8, 16 bei SN4, SN8, SN16)\n"
+    "- dimensions: string | null (Abmessungen wie '300/500', '500x500', '300x300mm' — "
+    "insbesondere bei Aufsaetzen, Rosten, Rahmen, Rinnen. Uebernimm exakt die Angabe aus dem LV.)\n"
     "- reference_product: string | null\n"
     "- installation_area: string | null (Fahrbahn, Gehweg, Erdeinbau)\n"
     "- sortiment_relevant: boolean (true wenn ein Tiefbau-Baustoffhaendler dieses Produkt "
@@ -87,20 +89,132 @@ SYSTEM_INSTRUCTION = (
     "Bei Dienstleistungen: false)\n\n"
     "Fuer Dienstleistungs-Positionen setze alle technischen Parameter auf null.\n"
     "Ueberspringe Ueberschriften (z.B. '1.5 Entwaesserungsleitungen'), Vorbemerkungen, "
-    "Hinweise und nicht-bepreisbare Zeilen (ohne Menge/Einheit).\n"
+    "Hinweise und nicht-bepreisbare Zeilen (ohne Menge/Einheit).\n\n"
+    "WICHTIG - Seitenumbrueche: Positionen koennen ueber Seitenumbrueche gehen. "
+    "Wenn eine Seite mit 'Leistungsbeschreibung auf voranstehender Seite' oder "
+    "aehnlichem Fortsetzungstext beginnt, gefolgt von einer Menge und Einheit, "
+    "gehoert diese Menge zur letzten Position der vorherigen Seite. "
+    "Die Menge/Einheit am ENDE einer Position (direkt vor der naechsten Positionsnummer "
+    "oder vor 'Uebertrag') ist IMMER die korrekte Gesamtmenge der Position - "
+    "NICHT einzelne Stueckzahlen aus der Komponentenliste innerhalb der Beschreibung!\n"
     "Gib NUR das JSON-Array zurueck, keine Erklaerung."
 )
 
 
+METADATA_INSTRUCTION = (
+    "Du bist ein erfahrener Tiefbau-Fachberater. Analysiere die ersten Seiten dieses "
+    "Leistungsverzeichnisses und extrahiere die Projekt-Metadaten.\n\n"
+    "Gib ein JSON-Objekt zurueck mit diesen Feldern:\n"
+    "- bauvorhaben: string | null (Bauvorhaben-Bezeichnung, Projekttitel)\n"
+    "- objekt_nr: string | null (Objekt-/Projektnummer, Vergabenummer, Ausschreibungsnummer)\n"
+    "- submission_date: string | null (Submissionsdatum/Angebotsfrist im Format TT.MM.JJJJ)\n"
+    "- auftraggeber: string | null (Auftraggeber/Bauherr)\n"
+    "- kunde_name: string | null (Name des Unternehmens das die Anfrage/Ausschreibung stellt)\n"
+    "- kunde_adresse: string | null (Adresse des Absenders/Anfragenden)\n\n"
+    "Gib NUR das JSON-Objekt zurueck, keine Erklaerung."
+)
+
+
+def _extract_metadata_with_llm(first_pages_text: str) -> ProjectMetadata:
+    """Extract project metadata from the first pages of the LV using Gemini."""
+    if not settings.gemini_api_key:
+        return ProjectMetadata()
+
+    payload = {
+        "system_instruction": {"parts": [{"text": METADATA_INSTRUCTION}]},
+        "contents": [{"role": "user", "parts": [{"text": first_pages_text}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+        },
+    }
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent"
+        f"?key={settings.gemini_api_key}"
+    )
+    try:
+        with httpx.Client(timeout=30) as client:
+            response = client.post(endpoint, json=payload)
+        if response.status_code >= 400:
+            logger.warning("Metadata extraction failed: %s", response.status_code)
+            return ProjectMetadata()
+        data = response.json()
+        content = data["candidates"][0]["content"]["parts"][0]["text"]
+        # Metadata is a JSON object, not an array — extract {...}
+        stripped = content.strip()
+        if stripped.startswith("```"):
+            stripped = stripped.strip("`").replace("json", "", 1).strip()
+        obj_start = stripped.find("{")
+        obj_end = stripped.rfind("}")
+        if obj_start == -1 or obj_end == -1 or obj_end <= obj_start:
+            logger.warning("Metadata: no JSON object found in response")
+            return ProjectMetadata()
+        parsed = json.loads(stripped[obj_start : obj_end + 1])
+        if isinstance(parsed, dict):
+            return ProjectMetadata(**{k: v for k, v in parsed.items() if v})
+    except Exception as exc:
+        logger.warning("Metadata extraction error: %s", exc)
+    return ProjectMetadata()
+
+
+_CONTINUATION_PATTERNS = (
+    "leistungsbeschreibung auf voranstehender seite",
+    "leistungsbeschreibung auf vorhergehender seite",
+    "fortsetzung von seite",
+    "übertrag",
+)
+
+
 def extract_raw_text_pages(pdf_bytes: bytes) -> list[str]:
-    """Extract raw text per page using pdfplumber."""
-    pages: list[str] = []
+    """Extract raw text per page using pdfplumber.
+
+    Detects page-continuation patterns (e.g. 'Leistungsbeschreibung auf
+    voranstehender Seite') and appends the continuation text to the previous
+    page so that positions spanning a page break are kept together.
+    """
+    raw_pages: list[str] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             if text.strip():
-                pages.append(text)
-    return pages
+                raw_pages.append(text)
+
+    if not raw_pages:
+        return raw_pages
+
+    # Merge continuation pages into the previous page
+    merged: list[str] = [raw_pages[0]]
+    for page_text in raw_pages[1:]:
+        lines = page_text.strip().split("\n")
+        # Skip header lines (Architekt, Objekt, POS. LEISTUNGSBESCHREIBUNG etc.)
+        content_start = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip().lower()
+            if any(pat in stripped for pat in _CONTINUATION_PATTERNS):
+                content_start = i
+                break
+        if content_start > 0:
+            # Found continuation — extract the continuation block (up to next position)
+            continuation_lines = lines[content_start:]
+            # Find where actual new positions start (line starting with a position number)
+            import re
+            merge_end = len(continuation_lines)
+            for j, cline in enumerate(continuation_lines):
+                # A new position starts with a number like "04.0016" at the beginning
+                if j > 0 and re.match(r"^\s*\d{2}\.\d{4}\s", cline):
+                    merge_end = j
+                    break
+
+            # Append continuation to previous page
+            merged[-1] += "\n" + "\n".join(continuation_lines[:merge_end])
+            # Rest of page (new positions) stays as a new page
+            remaining = "\n".join(lines[:content_start]) + "\n" + "\n".join(continuation_lines[merge_end:])
+            if remaining.strip():
+                merged.append(remaining)
+        else:
+            merged.append(page_text)
+
+    return merged
 
 
 def _create_page_batches(pages: list[str]) -> list[tuple[int, list[str]]]:
@@ -173,13 +287,47 @@ def _call_gemini_parse_batch(page_texts: list[str], page_offset: int) -> list[di
     return parsed
 
 
+def _assign_source_pages(
+    batch_result: list[dict[str, Any]], page_offset: int, num_pages: int,
+) -> list[dict[str, Any]]:
+    """Tag each raw position dict with a source_page based on the batch page offset."""
+    # Simple heuristic: assign page_offset+1 (1-based) to all positions in this batch.
+    # Better than nothing — positions are roughly ordered by page.
+    mid_page = page_offset + (num_pages // 2) + 1
+    for pos in batch_result:
+        if "source_page" not in pos:
+            pos["source_page"] = mid_page
+    return batch_result
+
+
 def _deduplicate_positions(all_raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the first occurrence of each ordnungszahl."""
+    """Keep the most complete occurrence of each ordnungszahl.
+
+    When a position spans a page boundary, different batches may parse it
+    with varying completeness. Prefer the entry that has quantity filled in,
+    and merge missing fields from duplicates.
+    """
     seen: dict[str, dict[str, Any]] = {}
     for pos in all_raw:
         oz = pos.get("ordnungszahl", "")
-        if oz and oz not in seen:
+        if not oz:
+            continue
+        if oz not in seen:
             seen[oz] = pos
+        else:
+            existing = seen[oz]
+            # Prefer the entry with a quantity if one is missing
+            if existing.get("quantity") is None and pos.get("quantity") is not None:
+                # New entry has quantity, old doesn't — use new as base
+                for key, val in existing.items():
+                    if val is not None and pos.get(key) is None:
+                        pos[key] = val
+                seen[oz] = pos
+            else:
+                # Fill missing fields from the duplicate
+                for key, val in pos.items():
+                    if val is not None and existing.get(key) is None:
+                        existing[key] = val
     return list(seen.values())
 
 
@@ -235,6 +383,7 @@ def _assemble_position(idx: int, raw: dict[str, Any]) -> LVPosition:
         billable=pos_type == "material",
         position_type=pos_type,
         parameters=params,
+        source_page=raw.get("source_page"),
     )
 
 
@@ -302,11 +451,18 @@ def _validate_with_heuristics(positions: list[LVPosition]) -> list[LVPosition]:
     return validated
 
 
-def parse_lv_with_llm(pdf_bytes: bytes) -> list[LVPosition]:
-    """Parse an LV PDF using Gemini LLM for position extraction and classification."""
+def parse_lv_with_llm(pdf_bytes: bytes) -> tuple[list[LVPosition], ProjectMetadata]:
+    """Parse an LV PDF using Gemini LLM for position extraction and classification.
+
+    Returns (positions, metadata) tuple.
+    """
     pages = extract_raw_text_pages(pdf_bytes)
     if not pages:
-        return []
+        return [], ProjectMetadata()
+
+    # Extract metadata from first few pages (in parallel with position parsing)
+    first_pages_text = "\n".join(pages[:3])
+    metadata = _extract_metadata_with_llm(first_pages_text)
 
     batches = _create_page_batches(pages)
     all_raw_positions: list[dict[str, Any]] = []
@@ -314,6 +470,7 @@ def parse_lv_with_llm(pdf_bytes: bytes) -> list[LVPosition]:
     for page_offset, batch_pages in batches:
         try:
             batch_result = _call_gemini_parse_batch(batch_pages, page_offset)
+            _assign_source_pages(batch_result, page_offset, len(batch_pages))
             all_raw_positions.extend(batch_result)
             logger.info(
                 "LLM batch pages %d-%d: %d positions found",
@@ -351,4 +508,4 @@ def parse_lv_with_llm(pdf_bytes: bytes) -> list[LVPosition]:
         sum(1 for p in positions if p.position_type == "dienstleistung"),
     )
 
-    return positions
+    return positions, metadata

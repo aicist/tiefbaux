@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import LVProject, LVProjectPosition, Product
+from ..models import LVProject, LVProjectPosition, ManualOverride, Product
 from ..schemas import (
     CompatibilityCheckRequest,
     CompatibilityIssue,
@@ -21,12 +21,15 @@ from ..schemas import (
     HealthResponse,
     LVPosition,
     OfferLine,
+    OverrideRequest,
     ParseLVResponse,
     PositionSuggestions,
     ProductSearchResult,
     ProductSuggestion,
     ProjectDetailResponse,
+    ProjectMetadata,
     ProjectSummary,
+    SaveSelectionsRequest,
     SuggestionsRequest,
     SuggestionsResponse,
     TechnicalParameters,
@@ -37,10 +40,12 @@ from ..config import settings
 from ..services.ai_interpreter import enrich_positions_with_parameters
 from ..services.compatibility import check_compatibility
 from ..services.llm_parser import parse_lv_with_llm
-from ..services.match_validator import validate_matches
-from ..services.matcher import load_active_products, suggest_products_for_position
+from ..services.matcher import _description_hash, load_active_products, suggest_products_for_position
 from ..services.offer_export import build_offer_pdf, now_metadata
 from ..services.pdf_parser import extract_positions_from_pdf
+
+import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +88,18 @@ def _reconstruct_positions(db_positions: list[LVProjectPosition]) -> list[LVPosi
             billable=dbp.billable,
             position_type=dbp.position_type,
             parameters=params,
+            source_page=dbp.source_page,
         ))
     return result
 
 
 def _store_project(
-    db: Session, content_hash: str, filename: str | None, positions: list[LVPosition],
+    db: Session,
+    content_hash: str,
+    filename: str | None,
+    positions: list[LVPosition],
+    metadata: ProjectMetadata | None = None,
+    pdf_path: str | None = None,
 ) -> LVProject:
     """Persist parsed LV positions to the database."""
     billable = sum(1 for p in positions if p.billable)
@@ -100,7 +111,16 @@ def _store_project(
         total_positions=len(positions),
         billable_positions=billable,
         service_positions=service,
+        pdf_path=pdf_path,
     )
+    if metadata:
+        project.bauvorhaben = metadata.bauvorhaben
+        project.objekt_nr = metadata.objekt_nr
+        project.submission_date = metadata.submission_date
+        project.auftraggeber = metadata.auftraggeber
+        project.kunde_name = metadata.kunde_name
+        project.kunde_adresse = metadata.kunde_adresse
+
     db.add(project)
     db.flush()
 
@@ -116,6 +136,7 @@ def _store_project(
             billable=pos.billable,
             position_type=pos.position_type,
             parameters_json=pos.parameters.model_dump_json() if pos.parameters else None,
+            source_page=pos.source_page,
         ))
     db.commit()
     return project
@@ -140,6 +161,21 @@ async def parse_lv(file: UploadFile = File(...), db: Session = Depends(get_db)) 
     if existing:
         logger.info("Duplicate LV detected (hash=%s, project_id=%d)", content_hash[:12], existing.id)
         positions = _reconstruct_positions(existing.positions)
+        metadata = ProjectMetadata(
+            bauvorhaben=existing.bauvorhaben,
+            objekt_nr=existing.objekt_nr,
+            submission_date=existing.submission_date,
+            auftraggeber=existing.auftraggeber,
+            kunde_name=existing.kunde_name,
+            kunde_adresse=existing.kunde_adresse,
+        )
+        # Feature 5: Return stored selections
+        selections = None
+        if existing.selections_json:
+            try:
+                selections = json.loads(existing.selections_json)
+            except Exception:
+                pass
         return ParseLVResponse(
             positions=positions,
             total_positions=existing.total_positions,
@@ -152,21 +188,35 @@ async def parse_lv(file: UploadFile = File(...), db: Session = Depends(get_db)) 
                 created_at=existing.created_at,
                 total_positions=existing.total_positions,
             ),
+            metadata=metadata,
         )
 
     # New LV — parse normally
+    metadata = ProjectMetadata()
     if settings.gemini_api_key:
         try:
-            positions = parse_lv_with_llm(pdf_bytes)
+            positions, metadata = parse_lv_with_llm(pdf_bytes)
         except Exception as exc:
             logger.warning("LLM parsing failed, falling back to regex: %s", exc)
             positions = _fallback_parse(pdf_bytes)
     else:
         positions = _fallback_parse(pdf_bytes)
 
+    # Feature 8: Store PDF file on disk
+    uploads_dir = Path(settings.project_root) / "backend" / "uploads"
+    uploads_dir.mkdir(exist_ok=True)
+    pdf_filename = f"{content_hash}.pdf"
+    pdf_path = str(uploads_dir / pdf_filename)
+    try:
+        with open(pdf_path, "wb") as f:
+            f.write(pdf_bytes)
+    except Exception as exc:
+        logger.warning("Failed to save PDF: %s", exc)
+        pdf_path = None
+
     # Store for future duplicate detection
     try:
-        project = _store_project(db, content_hash, file.filename, positions)
+        project = _store_project(db, content_hash, file.filename, positions, metadata, pdf_path)
         duplicate_info = DuplicateInfo(is_duplicate=False, project_id=project.id)
     except Exception as exc:
         logger.warning("Failed to store LV project: %s", exc)
@@ -178,13 +228,14 @@ async def parse_lv(file: UploadFile = File(...), db: Session = Depends(get_db)) 
         billable_positions=sum(1 for p in positions if p.billable),
         service_positions=sum(1 for p in positions if p.position_type == "dienstleistung"),
         duplicate=duplicate_info,
+        metadata=metadata,
     )
 
 
-def _compute_confidence(suggestion: ProductSuggestion, llm_validated: bool) -> str:
-    if suggestion.score > 60 and llm_validated:
+def _compute_confidence(suggestion: ProductSuggestion) -> str:
+    if suggestion.score > 60:
         return "high"
-    if suggestion.score >= 35 and llm_validated:
+    if suggestion.score >= 40:
         return "medium"
     return "low"
 
@@ -199,25 +250,13 @@ def get_suggestions(request: SuggestionsRequest, db: Session = Depends(get_db)) 
         suggestions = suggest_products_for_position(db, position, products=products)
         scored_pairs.append((position, suggestions))
 
-    # Phase 2: LLM match validation
-    pairs_with_suggestions = [
-        (pos, sugs) for pos, sugs in scored_pairs if sugs
-    ]
-    validated_map: dict[str, list[ProductSuggestion]] = {}
-    llm_validated = False
-    if pairs_with_suggestions:
-        validated = validate_matches(pairs_with_suggestions)
-        validated_map = {pos.id: sugs for pos, sugs in validated}
-        llm_validated = True
-
-    # Phase 3: Assemble response with confidence
+    # Phase 2: Assemble response with confidence (purely score-based)
     position_suggestions: list[PositionSuggestions] = []
     selected_for_check: list[tuple[LVPosition, object]] = []
 
-    for position, original_suggestions in scored_pairs:
-        final_suggestions = validated_map.get(position.id, original_suggestions)
+    for position, final_suggestions in scored_pairs:
         for s in final_suggestions:
-            s.confidence = _compute_confidence(s, llm_validated)
+            s.confidence = _compute_confidence(s)
         position_suggestions.append(
             PositionSuggestions(
                 position_id=position.id,
@@ -229,9 +268,7 @@ def get_suggestions(request: SuggestionsRequest, db: Session = Depends(get_db)) 
         if final_suggestions:
             selected_for_check.append((position, final_suggestions[0]))
 
-    compatibility_issues = check_compatibility(selected_for_check)
-
-    return SuggestionsResponse(suggestions=position_suggestions, compatibility_issues=compatibility_issues)
+    return SuggestionsResponse(suggestions=position_suggestions, compatibility_issues=[])
 
 
 
@@ -298,6 +335,16 @@ def _build_offer_lines(
                 ordnungszahl=position.ordnungszahl,
                 reason="Kein Preis verfügbar, 0 EUR verwendet",
             ))
+
+        custom_unit_price = request.custom_unit_prices.get(position_id)
+        if custom_unit_price is not None:
+            if custom_unit_price < unit_price:
+                warnings.append(ExportWarning(
+                    position_id=position_id,
+                    ordnungszahl=position.ordnungszahl,
+                    reason="VK unter EK nicht erlaubt, EK verwendet",
+                ))
+            unit_price = max(unit_price, custom_unit_price)
 
         if position.quantity is None:
             warnings.append(ExportWarning(
@@ -436,14 +483,26 @@ def _project_to_summary(p: LVProject) -> ProjectSummary:
         billable_positions=p.billable_positions,
         service_positions=p.service_positions,
         created_at=p.created_at,
+        bauvorhaben=p.bauvorhaben,
+        objekt_nr=p.objekt_nr,
+        submission_date=p.submission_date,
+        kunde_name=p.kunde_name,
     )
 
 
 @router.get("/projects", response_model=list[ProjectSummary])
-def list_projects(db: Session = Depends(get_db)) -> list[ProjectSummary]:
-    projects = db.scalars(
-        select(LVProject).order_by(LVProject.created_at.desc())
-    ).all()
+def list_projects(q: str = "", db: Session = Depends(get_db)) -> list[ProjectSummary]:
+    query = select(LVProject).order_by(LVProject.created_at.desc())
+    if q:
+        like_q = f"%{q}%"
+        query = query.where(
+            LVProject.filename.ilike(like_q)
+            | LVProject.bauvorhaben.ilike(like_q)
+            | LVProject.kunde_name.ilike(like_q)
+            | LVProject.objekt_nr.ilike(like_q)
+            | LVProject.project_name.ilike(like_q)
+        )
+    projects = db.scalars(query).all()
     return [_project_to_summary(p) for p in projects]
 
 
@@ -453,7 +512,26 @@ def get_project(project_id: int, db: Session = Depends(get_db)) -> ProjectDetail
     if not project:
         raise HTTPException(status_code=404, detail="Projekt nicht gefunden")
     positions = _reconstruct_positions(project.positions)
-    return ProjectDetailResponse(project=_project_to_summary(project), positions=positions)
+    metadata = ProjectMetadata(
+        bauvorhaben=project.bauvorhaben,
+        objekt_nr=project.objekt_nr,
+        submission_date=project.submission_date,
+        auftraggeber=project.auftraggeber,
+        kunde_name=project.kunde_name,
+        kunde_adresse=project.kunde_adresse,
+    )
+    selections = None
+    if project.selections_json:
+        try:
+            selections = json.loads(project.selections_json)
+        except Exception:
+            pass
+    return ProjectDetailResponse(
+        project=_project_to_summary(project),
+        positions=positions,
+        metadata=metadata,
+        selections=selections,
+    )
 
 
 @router.delete("/projects/{project_id}")
@@ -464,3 +542,60 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
     db.delete(project)
     db.commit()
     return {"ok": True}
+
+
+@router.post("/projects/save-selections")
+def save_selections(request: SaveSelectionsRequest, db: Session = Depends(get_db)):
+    """Feature 5: Save article selections for a project (for duplicate reuse)."""
+    project = db.get(LVProject, request.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Projekt nicht gefunden")
+    project.selections_json = json.dumps(request.selected_article_ids)
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/overrides")
+def record_override(request: OverrideRequest, db: Session = Depends(get_db)):
+    """Feature 6: Record a manual product selection for learning."""
+    desc_hash = _description_hash(request.position_description)
+    existing = db.scalar(
+        select(ManualOverride).where(
+            ManualOverride.description_hash == desc_hash,
+            ManualOverride.chosen_artikel_id == request.chosen_artikel_id,
+        )
+    )
+    if existing:
+        existing.override_count += 1
+        existing.updated_at = datetime.now()
+    else:
+        db.add(ManualOverride(
+            description_hash=desc_hash,
+            ordnungszahl_pattern=request.ordnungszahl,
+            category=request.category,
+            dn=request.dn,
+            material=request.material,
+            chosen_artikel_id=request.chosen_artikel_id,
+        ))
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/projects/{project_id}/pdf")
+def get_project_pdf(project_id: int, db: Session = Depends(get_db)):
+    """Feature 8: Serve the stored PDF file for a project."""
+    project = db.get(LVProject, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Projekt nicht gefunden")
+    if not project.pdf_path or not os.path.exists(project.pdf_path):
+        raise HTTPException(status_code=404, detail="PDF nicht verfügbar")
+
+    def _iter_file():
+        with open(project.pdf_path, "rb") as f:
+            yield f.read()
+
+    return StreamingResponse(
+        _iter_file(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{project.filename or "lv.pdf"}"'},
+    )

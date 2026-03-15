@@ -45,15 +45,17 @@ def _build_validation_prompt(
     lines: list[str] = []
     pair_idx = 0
     for position, candidates in pairs:
-        for candidate in candidates:
+        # Only validate the top candidate per position (reduces pairs, improves index stability)
+        top_candidate = candidates[0] if candidates else None
+        if top_candidate:
             lines.append(
                 f"Paar {pair_idx}:\n"
                 f"  LV-Position: {position.ordnungszahl} - {position.description}\n"
                 f"  Rohtext: {position.raw_text[:300]}\n"
-                f"  Vorgeschlagenes Produkt: {candidate.artikelname} "
-                f"(Kategorie: {candidate.category or '?'}, DN: {candidate.dn or '?'}, "
-                f"Belastungsklasse: {candidate.load_class or '?'})\n"
-                f"  Score: {candidate.score}"
+                f"  Vorgeschlagenes Produkt: {top_candidate.artikelname} "
+                f"(Kategorie: {top_candidate.category or '?'}, DN: {top_candidate.dn or '?'}, "
+                f"Belastungsklasse: {top_candidate.load_class or '?'})\n"
+                f"  Score: {top_candidate.score}"
             )
             pair_idx += 1
 
@@ -141,28 +143,38 @@ def validate_matches(
         idx = result.get("pair_index", -1)
         validation_map[idx] = result
 
-    # Filter candidates based on validation
+    # Filter candidates based on validation (only top candidate was validated)
     validated: list[tuple[LVPosition, list[ProductSuggestion]]] = []
     pair_idx = 0
     for position, candidates in pairs_with_suggestions:
-        filtered: list[ProductSuggestion] = []
-        for candidate in candidates:
-            validation = validation_map.get(pair_idx)
-            if validation is None:
-                # No validation result -> keep (conservative)
-                filtered.append(candidate)
-            elif validation.get("valid", True):
-                filtered.append(candidate)
+        if not candidates:
+            validated.append((position, candidates))
+            continue
+
+        validation = validation_map.get(pair_idx)
+        pair_idx += 1
+
+        if validation is None or validation.get("valid", True):
+            # LLM says valid or no result — keep all candidates
+            validated.append((position, candidates))
+        else:
+            reason = validation.get("reason", "keine Begruendung")
+            top = candidates[0]
+            if top.score >= 50:
+                # High-score match: keep but warn
+                logger.info(
+                    "LLM rejected but keeping (score %.0f): %s -> %s (%s)",
+                    top.score, position.ordnungszahl, top.artikelname, reason,
+                )
+                top.warnings.append("LLM-Validierung unsicher")
+                validated.append((position, candidates))
             else:
-                reason = validation.get("reason", "keine Begruendung")
+                # Low-score match: remove all candidates for this position
                 logger.info(
                     "Match rejected by LLM: %s -> %s (%s)",
-                    position.ordnungszahl,
-                    candidate.artikelname,
-                    reason,
+                    position.ordnungszahl, top.artikelname, reason,
                 )
-            pair_idx += 1
-        validated.append((position, filtered))
+                validated.append((position, []))
 
     # Re-add positions that had no suggestions (weren't sent to validation)
     validated_ids = {pos.id for pos, _ in validated}

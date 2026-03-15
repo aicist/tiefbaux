@@ -1,13 +1,18 @@
 import { useState } from 'react'
-import type { CompatibilityIssue, LVPosition, ProductSearchResult, ProductSuggestion, TechnicalParameters } from '../types'
+import type { CompatibilityIssue, LVPosition, PriceAdjustment, ProductSearchResult, ProductSuggestion, TechnicalParameters } from '../types'
+import { DinBadge } from './DinBadge'
 import { ParameterEditor } from './ParameterEditor'
+import { PriceAdjustmentControl } from './PriceAdjustmentControl'
 import { ProductSearchModal } from './ProductSearchModal'
+import { computeAdjustedTotal, computeAdjustedUnitPrice, isAdjustedPrice } from '../utils/pricing'
 
 const PARAM_STYLES: Record<string, React.CSSProperties> = {
   match: { background: '#dcfce7', color: '#166534' },
   mismatch: { background: '#fee2e2', color: '#991b1b' },
   neutral: { background: '#f1f5f9', color: '#334155' },
 }
+
+const LOAD_CLASS_CATEGORIES = new Set(['Schachtabdeckungen', 'Straßenentwässerung'])
 
 function ParamBadge({ label, status }: { label: string; status: 'match' | 'mismatch' | 'neutral' }) {
   return (
@@ -29,11 +34,13 @@ type Props = {
   activePosition: LVPosition | null
   suggestions: ProductSuggestion[]
   selectedArticleId: string | undefined
+  priceAdjustment?: PriceAdjustment
   onSelectArticle: (positionId: string, artikelId: string) => void
   onManualSelect: (positionId: string, product: ProductSearchResult) => void
   compatibilityIssues: CompatibilityIssue[]
   onParameterChange: (positionId: string, params: Partial<TechnicalParameters>) => void
   isRefreshingSuggestions: boolean
+  onPriceAdjustmentChange: (positionId: string, adjustment: PriceAdjustment) => void
 }
 
 function formatMoney(value?: number | null, currency = 'EUR'): string {
@@ -61,11 +68,13 @@ export function SuggestionsPanel({
   activePosition,
   suggestions,
   selectedArticleId,
+  priceAdjustment,
   onSelectArticle,
   onManualSelect,
   compatibilityIssues,
   onParameterChange,
   isRefreshingSuggestions,
+  onPriceAdjustmentChange,
 }: Props) {
   const [dismissedIds, setDismissedIds] = useState<Record<string, Set<string>>>({})
   const [searchOpen, setSearchOpen] = useState(false)
@@ -73,6 +82,12 @@ export function SuggestionsPanel({
   const posId = activePosition?.id ?? ''
   const dismissed = dismissedIds[posId] ?? new Set()
   const visibleSuggestions = suggestions.filter(s => !dismissed.has(s.artikel_id))
+  const selectedSuggestion = suggestions.find((s) => s.artikel_id === selectedArticleId) ?? visibleSuggestions[0] ?? null
+  const adjustedSelectedUnitPrice = computeAdjustedUnitPrice(selectedSuggestion?.price_net, priceAdjustment)
+  const adjustedSelectedTotal = computeAdjustedTotal(adjustedSelectedUnitPrice, activePosition?.quantity)
+  const showLoadClass = activePosition?.parameters.product_category
+    ? LOAD_CLASS_CATEGORIES.has(activePosition.parameters.product_category)
+    : false
 
   function handleDismiss(artikelId: string) {
     if (!activePosition) return
@@ -81,7 +96,6 @@ export function SuggestionsPanel({
       current.add(artikelId)
       return { ...prev, [posId]: current }
     })
-    // If dismissed article was selected, auto-select next
     if (selectedArticleId === artikelId) {
       const next = visibleSuggestions.find(s => s.artikel_id !== artikelId)
       if (next) onSelectArticle(activePosition.id, next.artikel_id)
@@ -120,6 +134,16 @@ export function SuggestionsPanel({
         />
       )}
 
+      {activePosition && selectedSuggestion && (
+        <PriceAdjustmentControl
+          adjustment={priceAdjustment}
+          baseUnitPrice={selectedSuggestion.price_net}
+          quantity={activePosition.quantity}
+          currency={selectedSuggestion.currency}
+          onChange={(next) => onPriceAdjustmentChange(activePosition.id, next)}
+        />
+      )}
+
       {activePosition && visibleSuggestions.length === 0 && !isRefreshingSuggestions && (
         <div className="no-match-info">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
@@ -142,13 +166,16 @@ export function SuggestionsPanel({
           visibleSuggestions.map((suggestion, idx) => {
             const isSelected = selectedArticleId === suggestion.artikel_id
             const stock = stockStatus(suggestion.stock)
-            const isBest = idx === 0 && !suggestion.is_manual
+            const isBest = idx === 0 && !suggestion.is_manual && !suggestion.is_override
             const hasWarnings = suggestion.warnings.length > 0
+            const isSelectedAdjusted = isSelected && isAdjustedPrice(suggestion.price_net, adjustedSelectedUnitPrice)
+            const displayUnitPrice = isSelectedAdjusted ? adjustedSelectedUnitPrice : suggestion.price_net
+            const displayTotal = isSelectedAdjusted ? adjustedSelectedTotal : suggestion.total_net
 
             return (
               <div
                 key={suggestion.artikel_id}
-                className={`suggestion-card ${isSelected ? 'selected' : ''} ${suggestion.is_manual ? 'manual' : ''}`}
+                className={`suggestion-card ${isSelected ? 'selected' : ''} ${suggestion.is_manual ? 'manual' : ''} ${suggestion.is_override ? 'override' : ''}`}
               >
                 <div className="suggestion-body" onClick={() => {
                   if (!isSelected) onSelectArticle(activePosition.id, suggestion.artikel_id)
@@ -156,11 +183,12 @@ export function SuggestionsPanel({
                   <div className="suggestion-header">
                     <div className="suggestion-title-group">
                       {suggestion.is_manual && <span className="manual-badge">Manuell gewählt</span>}
+                      {suggestion.is_override && <span className="override-badge">Häufig gewählt von Kollegen</span>}
                       {isBest && <span className="best-badge">Bester Treffer</span>}
                       <strong className="suggestion-name">{suggestion.artikelname}</strong>
                     </div>
                     <div className="suggestion-header-actions">
-                      {!suggestion.is_manual && suggestion.score_breakdown.length > 0 && (
+                      {!suggestion.is_manual && !suggestion.is_override && suggestion.score_breakdown.length > 0 && (
                         <details className="score-details" onClick={e => e.stopPropagation()}>
                           <summary
                             className="score-badge"
@@ -209,25 +237,45 @@ export function SuggestionsPanel({
                         status={reqSn == null ? 'neutral' : suggestion.sn! >= reqSn ? 'match' : 'mismatch'}
                       />
                     })()}
-                    {suggestion.load_class && <ParamBadge
+                    {showLoadClass && suggestion.load_class && <ParamBadge
                       label={suggestion.load_class}
                       status={!activePosition?.parameters.load_class ? 'neutral' : activePosition.parameters.load_class.toUpperCase() === suggestion.load_class.toUpperCase() ? 'match' : 'mismatch'}
                     />}
-                    {suggestion.norm && <ParamBadge
-                      label={suggestion.norm}
-                      status={!activePosition?.parameters.norm ? 'neutral' : suggestion.norm.toLowerCase().includes(activePosition.parameters.norm.toLowerCase()) ? 'match' : 'mismatch'}
-                    />}
+                    {suggestion.norm && (
+                      <span className={`param-badge param-${!activePosition?.parameters.norm ? 'neutral' : suggestion.norm.toLowerCase().includes(activePosition.parameters.norm.toLowerCase()) ? 'match' : 'mismatch'}`}
+                        style={{
+                          ...PARAM_STYLES[!activePosition?.parameters.norm ? 'neutral' : suggestion.norm.toLowerCase().includes(activePosition.parameters.norm.toLowerCase()) ? 'match' : 'mismatch'],
+                          padding: '1px 7px', borderRadius: '4px', fontSize: '0.7rem', fontWeight: 600,
+                        }}
+                      >
+                        <DinBadge norm={suggestion.norm} />
+                      </span>
+                    )}
                   </div>
 
-                  <div className="suggestion-price-row">
-                    <div className="price-group">
-                      <span className="price-main">{formatMoney(suggestion.price_net, suggestion.currency)}</span>
-                      <span className="price-label">/ Einheit</span>
+                  <div className="suggestion-price-stack">
+                    <div className="suggestion-price-row">
+                      <div className="price-group">
+                        <span className="price-main">{formatMoney(suggestion.price_net, suggestion.currency)}</span>
+                        <span className="price-label">EK / Einheit</span>
+                      </div>
+                      <div className="price-group">
+                        <span className="price-total">{formatMoney(suggestion.total_net, suggestion.currency)}</span>
+                        <span className="price-label">EK gesamt</span>
+                      </div>
                     </div>
-                    <div className="price-group">
-                      <span className="price-total">{formatMoney(suggestion.total_net, suggestion.currency)}</span>
-                      <span className="price-label">Gesamt</span>
-                    </div>
+                    {isSelectedAdjusted && (
+                      <div className="suggestion-price-row suggestion-price-row-vk">
+                        <div className="price-group">
+                          <span className="price-main">{formatMoney(displayUnitPrice, suggestion.currency)}</span>
+                          <span className="price-label">VK / Einheit</span>
+                        </div>
+                        <div className="price-group">
+                          <span className="price-total">{formatMoney(displayTotal, suggestion.currency)}</span>
+                          <span className="price-label">VK gesamt</span>
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   <div className="suggestion-stock-row">

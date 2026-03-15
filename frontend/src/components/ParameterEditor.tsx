@@ -13,6 +13,7 @@ const CATEGORIES = [
 ]
 
 const LOAD_CLASSES = ['', 'A15', 'B125', 'C250', 'D400', 'E600', 'F900']
+const LOAD_CLASS_CATEGORIES = new Set(['Schachtabdeckungen', 'Straßenentwässerung'])
 
 type Props = {
   position: LVPosition
@@ -36,6 +37,8 @@ export function ParameterEditor({ position, onParameterChange, isRefreshing }: P
   const [material, setMaterial] = useState(params.material ?? '')
   const [loadClass, setLoadClass] = useState(params.load_class ?? '')
   const [isCollapsed, setIsCollapsed] = useState(true)
+
+  const showLoadClass = LOAD_CLASS_CATEGORIES.has(category)
 
   // Sync when position changes
   useEffect(() => {
@@ -70,7 +73,13 @@ export function ParameterEditor({ position, onParameterChange, isRefreshing }: P
   }
   const handleCategoryChange = (value: string) => {
     setCategory(value)
-    commitChanges({ category: value })
+    // Clear load class if switching to a non-relevant category
+    if (!LOAD_CLASS_CATEGORIES.has(value)) {
+      setLoadClass('')
+      commitChanges({ category: value, loadClass: '' })
+    } else {
+      commitChanges({ category: value })
+    }
   }
   const handleLoadClassChange = (value: string) => {
     setLoadClass(value)
@@ -143,18 +152,20 @@ export function ParameterEditor({ position, onParameterChange, isRefreshing }: P
               className="param-input"
             />
           </label>
-          <label className="param-field">
-            <span className="param-label">Belastungsklasse</span>
-            <select
-              value={loadClass}
-              onChange={(e) => handleLoadClassChange(e.target.value)}
-              className="param-input"
-            >
-              {LOAD_CLASSES.map((lc) => (
-                <option key={lc} value={lc}>{lc || '— nicht relevant —'}</option>
-              ))}
-            </select>
-          </label>
+          {showLoadClass && (
+            <label className="param-field">
+              <span className="param-label">Belastungsklasse</span>
+              <select
+                value={loadClass}
+                onChange={(e) => handleLoadClassChange(e.target.value)}
+                className="param-input"
+              >
+                {LOAD_CLASSES.map((lc) => (
+                  <option key={lc} value={lc}>{lc || '— nicht relevant —'}</option>
+                ))}
+              </select>
+            </label>
+          )}
         </div>
       </div>
     </div>

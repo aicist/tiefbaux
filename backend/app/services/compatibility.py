@@ -69,74 +69,74 @@ def check_compatibility(selected: list[tuple[LVPosition, ProductSuggestion]]) ->
     schacht_konus = [(p, s) for p, s in selected if _is_subcategory(s, "konus") or _is_subcategory(s, "schachthals")]
 
     if schacht_under and schacht_ring:
+        ring_dns = {s_ring.dn for _, s_ring in schacht_ring if s_ring.dn}
         for p_under, s_under in schacht_under:
-            for p_ring, s_ring in schacht_ring:
-                if s_under.dn and s_ring.dn and s_under.dn != s_ring.dn:
-                    issues.append(
-                        CompatibilityIssue(
-                            severity="KRITISCH",
-                            rule="Schachtunterteil-Schachtring DN gleich",
-                            message=(
-                                f"DN-Konflikt zwischen {s_under.artikel_id} (DN{s_under.dn}) "
-                                f"und {s_ring.artikel_id} (DN{s_ring.dn})."
-                            ),
-                            positions=[p_under.id, p_ring.id],
-                        )
+            if s_under.dn and s_under.dn not in ring_dns:
+                issues.append(
+                    CompatibilityIssue(
+                        severity="KRITISCH",
+                        rule="Schachtunterteil-Schachtring DN gleich",
+                        message=(
+                            f"Schachtunterteil {s_under.artikel_id} (DN{s_under.dn}) — "
+                            f"kein passender Schachtring mit DN{s_under.dn} im Projekt."
+                        ),
+                        positions=[p_under.id],
                     )
+                )
 
     if schacht_ring and schacht_konus:
+        konus_dns = {s_konus.dn for _, s_konus in schacht_konus if s_konus.dn}
         for p_ring, s_ring in schacht_ring:
-            for p_konus, s_konus in schacht_konus:
-                if s_ring.dn and s_konus.dn and s_ring.dn != s_konus.dn:
-                    issues.append(
-                        CompatibilityIssue(
-                            severity="KRITISCH",
-                            rule="Schachtring-Konus DN gleich",
-                            message=(
-                                f"DN-Konflikt zwischen {s_ring.artikel_id} (DN{s_ring.dn}) "
-                                f"und {s_konus.artikel_id} (DN{s_konus.dn})."
-                            ),
-                            positions=[p_ring.id, p_konus.id],
-                        )
+            if s_ring.dn and s_ring.dn not in konus_dns:
+                issues.append(
+                    CompatibilityIssue(
+                        severity="KRITISCH",
+                        rule="Schachtring-Konus DN gleich",
+                        message=(
+                            f"Schachtring {s_ring.artikel_id} (DN{s_ring.dn}) — "
+                            f"kein passender Konus mit DN{s_ring.dn} im Projekt."
+                        ),
+                        positions=[p_ring.id],
                     )
+                )
 
-    # Rule: Straßenablauf DN equals connected pipe DN.
+    # Rule: Straßenablauf DN must have at least one matching pipe DN in the project.
     ablaeufe = [(p, s) for p, s in selected if _is_subcategory(s, "straßenablauf") or _is_subcategory(s, "strassenablauf")]
     rohre = [(p, s) for p, s in selected if _is_subcategory(s, "kanalrohre") or _is_subcategory(s, "kg-rohr")]
 
     if ablaeufe and rohre:
+        rohr_dns = {s_r.dn for _, s_r in rohre if s_r.dn}
         for p_a, s_a in ablaeufe:
-            for p_r, s_r in rohre:
-                if s_a.dn and s_r.dn and s_a.dn != s_r.dn:
-                    issues.append(
-                        CompatibilityIssue(
-                            severity="KRITISCH",
-                            rule="Straßenablauf-Abgang zu Rohr",
-                            message=(
-                                f"Ablauf {s_a.artikel_id} DN{s_a.dn} passt nicht zu Rohr {s_r.artikel_id} DN{s_r.dn}."
-                            ),
-                            positions=[p_a.id, p_r.id],
-                        )
+            if s_a.dn and s_a.dn not in rohr_dns:
+                issues.append(
+                    CompatibilityIssue(
+                        severity="KRITISCH",
+                        rule="Straßenablauf-Abgang zu Rohr",
+                        message=(
+                            f"Ablauf {s_a.artikel_id} DN{s_a.dn} — kein passendes Rohr mit DN{s_a.dn} im Projekt gefunden."
+                        ),
+                        positions=[p_a.id],
                     )
+                )
 
-    # Rule: Rinnenrost DN should match Rinnenkoerper DN.
+    # Rule: Rinnenrost DN should match at least one Rinnenkoerper DN.
     roste = [(p, s) for p, s in selected if _is_subcategory(s, "rinnenrost")]
     rinnen = [(p, s) for p, s in selected if _is_subcategory(s, "entwässerungsrinne") or _is_subcategory(s, "entwaesserungsrinne")]
 
     if roste and rinnen:
+        rinnen_dns = {s_ri.dn for _, s_ri in rinnen if s_ri.dn}
         for p_ro, s_ro in roste:
-            for p_ri, s_ri in rinnen:
-                if s_ro.dn and s_ri.dn and s_ro.dn != s_ri.dn:
-                    issues.append(
-                        CompatibilityIssue(
-                            severity="KRITISCH",
-                            rule="Rinnenrost passt zu Rinnenkörper",
-                            message=(
-                                f"Rost {s_ro.artikel_id} DN{s_ro.dn} passt nicht zur Rinne {s_ri.artikel_id} DN{s_ri.dn}."
-                            ),
-                            positions=[p_ro.id, p_ri.id],
-                        )
+            if s_ro.dn and s_ro.dn not in rinnen_dns:
+                issues.append(
+                    CompatibilityIssue(
+                        severity="KRITISCH",
+                        rule="Rinnenrost passt zu Rinnenkörper",
+                        message=(
+                            f"Rost {s_ro.artikel_id} DN{s_ro.dn} — keine passende Rinne mit DN{s_ro.dn} im Projekt."
+                        ),
+                        positions=[p_ro.id],
                     )
+                )
 
     # Rule: mixed load classes among same installation group -> warning.
     by_area: dict[str, list[tuple[LVPosition, ProductSuggestion]]] = defaultdict(list)

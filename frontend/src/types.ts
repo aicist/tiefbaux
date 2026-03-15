@@ -25,6 +25,7 @@ export type LVPosition = {
   billable: boolean
   position_type?: 'material' | 'dienstleistung' | null
   parameters: TechnicalParameters
+  source_page?: number | null
 }
 
 export type ScoreBreakdown = {
@@ -54,6 +55,7 @@ export type ProductSuggestion = {
   warnings: string[]
   score_breakdown: ScoreBreakdown[]
   is_manual?: boolean
+  is_override?: boolean
 }
 
 export type PositionSuggestions = {
@@ -70,6 +72,15 @@ export type CompatibilityIssue = {
   positions: string[]
 }
 
+export type ProjectMetadata = {
+  bauvorhaben?: string | null
+  objekt_nr?: string | null
+  submission_date?: string | null
+  auftraggeber?: string | null
+  kunde_name?: string | null
+  kunde_adresse?: string | null
+}
+
 export type DuplicateInfo = {
   is_duplicate: boolean
   project_id?: number | null
@@ -84,6 +95,7 @@ export type ParseResponse = {
   billable_positions: number
   service_positions: number
   duplicate?: DuplicateInfo | null
+  metadata?: ProjectMetadata | null
 }
 
 export type SuggestionResponse = {
@@ -102,6 +114,13 @@ export type ExportPreviewResponse = {
   total_count: number
   skipped_positions: ExportWarning[]
   total_net: number
+}
+
+export type PriceAdjustmentMode = 'percent' | 'absolute'
+
+export type PriceAdjustment = {
+  mode: PriceAdjustmentMode
+  value: string
 }
 
 export type ProductSearchResult = {
@@ -128,9 +147,21 @@ export type ProjectSummary = {
   billable_positions: number
   service_positions: number
   created_at: string
+  bauvorhaben?: string | null
+  objekt_nr?: string | null
+  submission_date?: string | null
+  kunde_name?: string | null
 }
 
 export type ProjectDetailResponse = {
   project: ProjectSummary
   positions: LVPosition[]
+  metadata?: ProjectMetadata | null
+  selections?: Record<string, string> | null
 }
+
+export type UndoAction =
+  | { type: 'select'; positionId: string; previousArticleId: string | undefined }
+  | { type: 'deselect'; positionId: string; previousArticleId: string }
+  | { type: 'skip'; positionId: string }
+  | { type: 'unskip'; positionId: string }

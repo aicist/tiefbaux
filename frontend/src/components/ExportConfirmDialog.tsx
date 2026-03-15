@@ -19,9 +19,6 @@ function formatMoney(value: number): string {
 export function ExportConfirmDialog({ isOpen, preview, onConfirm, onCancel, isExporting }: Props) {
   if (!isOpen || !preview) return null
 
-  const hasWarnings = preview.skipped_positions.length > 0
-  const skippedCount = preview.total_count - preview.included_count
-
   return (
     <div className="dialog-backdrop" onClick={onCancel}>
       <div className="dialog-box" onClick={(e) => e.stopPropagation()}>
@@ -37,25 +34,6 @@ export function ExportConfirmDialog({ isOpen, preview, onConfirm, onCancel, isEx
             <span className="dialog-stat-label">Netto-Gesamtwert</span>
           </div>
         </div>
-
-        {skippedCount > 0 && (
-          <p className="dialog-info">
-            {skippedCount} Position{skippedCount !== 1 ? 'en' : ''} ohne Zuordnung — nicht im Angebot enthalten.
-          </p>
-        )}
-
-        {hasWarnings && (
-          <div className="dialog-warnings">
-            <h4>Hinweise</h4>
-            <ul>
-              {preview.skipped_positions.map((w, i) => (
-                <li key={i}>
-                  <strong>{w.ordnungszahl}:</strong> {w.reason}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
 
         <div className="dialog-actions">
           <button className="btn btn-ghost" onClick={onCancel} disabled={isExporting}>

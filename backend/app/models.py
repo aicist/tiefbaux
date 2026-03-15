@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -71,6 +71,20 @@ class LVProject(Base):
     service_positions: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    # Feature 1+4: Project metadata from LV
+    bauvorhaben: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    objekt_nr: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    submission_date: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    auftraggeber: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    kunde_name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    kunde_adresse: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+
+    # Feature 5: Stored article selections for duplicate reuse
+    selections_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Feature 8: PDF storage
+    pdf_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+
     positions = relationship("LVProjectPosition", back_populates="project", cascade="all, delete-orphan")
 
 
@@ -88,5 +102,23 @@ class LVProjectPosition(Base):
     billable: Mapped[bool] = mapped_column(default=True)
     position_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     parameters_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Feature 10: Source page number from PDF
+    source_page: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     project = relationship("LVProject", back_populates="positions")
+
+
+class ManualOverride(Base):
+    """Feature 6: Tracks manual product selections by employees for learning."""
+    __tablename__ = "manual_overrides"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    description_hash: Mapped[str] = mapped_column(String(64), index=True)
+    ordnungszahl_pattern: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    category: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    dn: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    material: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    chosen_artikel_id: Mapped[str] = mapped_column(String(32), index=True)
+    override_count: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

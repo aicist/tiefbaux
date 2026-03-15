@@ -1,7 +1,10 @@
 import { useMemo, useState } from 'react'
 import type { LVPosition, ProductSuggestion } from '../types'
+import { DinBadge } from './DinBadge'
 
 type FilterMode = 'alle' | 'zugeordnet' | 'offen' | 'dienstleistung'
+
+const LOAD_CLASS_CATEGORIES = new Set(['Schachtabdeckungen', 'Straßenentwässerung'])
 
 type Props = {
   positions: LVPosition[]
@@ -12,6 +15,7 @@ type Props = {
   skippedPositionIds: Set<string>
   onToggleSkip: (positionId: string) => void
   compatibilityIssuePositionIds: Set<string>
+  onEnterAssignment?: () => void
 }
 
 function formatQty(value?: number | null): string {
@@ -29,14 +33,16 @@ export function PositionsList({
   skippedPositionIds,
   onToggleSkip,
   compatibilityIssuePositionIds,
+  onEnterAssignment,
 }: Props) {
+  const pageSize = 10
   const [searchTerm, setSearchTerm] = useState('')
   const [filterMode, setFilterMode] = useState<FilterMode>('alle')
+  const [currentPage, setCurrentPage] = useState(0)
 
   const filteredPositions = useMemo(() => {
     let filtered = positions
 
-    // Apply status filter
     if (filterMode !== 'alle') {
       filtered = filtered.filter((p) => {
         const isSkipped = skippedPositionIds.has(p.id)
@@ -49,7 +55,6 @@ export function PositionsList({
       })
     }
 
-    // Apply search term
     if (searchTerm.trim()) {
       const term = searchTerm.toLowerCase()
       filtered = filtered.filter(
@@ -62,6 +67,10 @@ export function PositionsList({
 
     return filtered
   }, [positions, searchTerm, filterMode, selectedArticleIds, skippedPositionIds])
+
+  const totalPages = Math.ceil(filteredPositions.length / pageSize)
+  const safePage = Math.min(currentPage, Math.max(0, totalPages - 1))
+  const pagedPositions = filteredPositions.slice(safePage * pageSize, (safePage + 1) * pageSize)
 
   const assignedCount = useMemo(
     () => positions.filter((p) => selectedArticleIds[p.id] && !skippedPositionIds.has(p.id)).length,
@@ -78,6 +87,15 @@ export function PositionsList({
           <h2>Erkannte Positionen</h2>
           <p className="panel-copy">Aus dem LV extrahierte bepreisbare Positionen.</p>
         </div>
+        {onEnterAssignment && positions.length > 0 && (
+          <button className="btn-toolbar btn-enter-assignment" onClick={onEnterAssignment} title="Zur fokussierten Zuordnungsansicht">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+              <rect x="3" y="3" width="18" height="18" rx="2" stroke="currentColor" strokeWidth="1.5" />
+              <path d="M9 12l2 2 4-4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            Zuordnung
+          </button>
+        )}
       </div>
 
       {positions.length > 0 && (
@@ -101,7 +119,7 @@ export function PositionsList({
               <button
                 key={mode}
                 className={`filter-chip ${filterMode === mode ? 'active' : ''}`}
-                onClick={() => setFilterMode(mode)}
+                onClick={() => { setFilterMode(mode); setCurrentPage(0) }}
               >
                 {mode === 'alle'
                   ? `Alle (${positions.length})`
@@ -123,7 +141,7 @@ export function PositionsList({
               type="text"
               placeholder="Positionen filtern..."
               value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
+              onChange={(e) => { setSearchTerm(e.target.value); setCurrentPage(0) }}
             />
           </div>
         </>
@@ -141,13 +159,14 @@ export function PositionsList({
             <p>Laden Sie ein LV-PDF hoch, um Positionen zu extrahieren.</p>
           </div>
         )}
-        {filteredPositions.map((position, index) => {
+        {pagedPositions.map((position, index) => {
           const isActive = position.id === activePositionId
           const isSkipped = skippedPositionIds.has(position.id)
           const hasSelection = Boolean(selectedArticleIds[position.id])
           const hasSuggestions = (suggestionMap[position.id] ?? []).length > 0
           const category = position.parameters.product_category
           const hasCompatIssue = compatibilityIssuePositionIds.has(position.id)
+          const showLoadClass = category ? LOAD_CLASS_CATEGORIES.has(category) : false
 
           let statusClass = 'status-open'
           if (isSkipped) statusClass = 'status-service'
@@ -206,14 +225,14 @@ export function PositionsList({
                   {position.parameters.nominal_diameter_dn != null && (
                     <span className="meta-tag">DN {position.parameters.nominal_diameter_dn}</span>
                   )}
-                  {position.parameters.load_class && (
+                  {showLoadClass && position.parameters.load_class && (
                     <span className="meta-tag">{position.parameters.load_class}</span>
                   )}
                   {position.parameters.material && (
                     <span className="meta-tag">{position.parameters.material}</span>
                   )}
                   {position.parameters.norm && (
-                    <span className="meta-tag">{position.parameters.norm}</span>
+                    <DinBadge norm={position.parameters.norm} className="meta-tag" />
                   )}
                   {position.parameters.stiffness_class_sn != null && (
                     <span className="meta-tag">SN{position.parameters.stiffness_class_sn}</span>
@@ -245,6 +264,28 @@ export function PositionsList({
           )
         })}
       </div>
+
+      {totalPages > 1 && (
+        <div className="pagination">
+          <button
+            className="pagination-btn"
+            disabled={safePage === 0}
+            onClick={() => setCurrentPage(safePage - 1)}
+          >
+            Zurück
+          </button>
+          <span className="pagination-info">
+            Seite {safePage + 1} von {totalPages}
+          </span>
+          <button
+            className="pagination-btn"
+            disabled={safePage >= totalPages - 1}
+            onClick={() => setCurrentPage(safePage + 1)}
+          >
+            Weiter
+          </button>
+        </div>
+      )}
     </section>
   )
 }
