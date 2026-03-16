@@ -21,16 +21,25 @@ LOAD_RANK = {
 }
 
 # DN equivalences: in practice DN100 = DN110 (OD 110mm), DN150 = DN160 (OD 160mm)
+# Extended for PE pressure pipes where DN differs from OD
 DN_EQUIVALENTS: dict[int, set[int]] = {
     100: {110},
     110: {100},
     150: {160},
     160: {150},
+    200: {225},
+    225: {200},
+    250: {280},
+    280: {250},
+    300: {315},
+    315: {300},
+    400: {450},
+    450: {400},
 }
 
 # Product type keywords for subcategory matching
 PRODUCT_TYPE_KEYWORDS: dict[str, list[str]] = {
-    "rohr": ["rohr", "leitung", "kanalleitung", "entwässerungskanalleitung"],
+    "rohr": ["rohr", "kanalleitung", "entwässerungskanalleitung"],
     "bogen": ["bogen", "bögen", "krümmer"],
     "abzweig": ["abzweig", "abzweige", "t-stück"],
     "muffe": ["muffe", "doppelmuffe", "überschiebmuffe"],
@@ -38,8 +47,9 @@ PRODUCT_TYPE_KEYWORDS: dict[str, list[str]] = {
     "schachtboden": ["schachtboden", "schachtunterteil"],
     "schachtrohr": ["schachtrohr"],
     "konus": ["konus", "schachthals", "schachtkonus"],
-    "abdeckung": ["abdeckung", "deckel", "abdeckplatte"],
+    "abdeckung": ["abdeckung", "deckel", "abdeckplatte", "wannenschachtabdeckung"],
     "ablauf": ["ablauf", "straßenablauf", "hofablauf", "einlauf"],
+    "rinne": ["rinne", "entwässerungsrinne", "schwerlastrinne", "powerdrain", "multiline"],
     "auslauf": ["auslauf", "auslaufstück", "froschklappe"],
 }
 
@@ -96,6 +106,28 @@ NON_PRODUCT_HINTS = (
     "zaehlereinrichtung",
     "verbindungsleit",
     "notversorgungsleitung",
+    # Nicht im Baustoff-Sortiment
+    "stützmauer",
+    "stuetzmauer",
+    "poller",
+    "blockstufe",
+    "rasenkantenstein",
+    "leitplanke",
+    "schutzplanke",
+    "rigole",
+    "rigolenkörper",
+    "rigolenkoerper",
+    "muldenrinne",
+    "fundament",
+    "zaun",
+    "zaunpfosten",
+    "beleuchtung",
+    "laterne",
+    "geländer",
+    "gelaender",
+    "baumschutz",
+    "baumwurzel",
+    "wurzelschutz",
 )
 
 
@@ -147,7 +179,7 @@ def _guess_category(position: LVPosition) -> tuple[str | None, str | None]:
         return "Schachtbauteile", None
     if re.search(r"\bstraßenablauf\b|\bstrassenablauf\b", text):
         return "Straßenentwässerung", "Straßenablauf"
-    if re.search(r"\brinne\b", text):
+    if re.search(r"\brinne\b", text) and not re.search(r"\bmuldenrinne\b", text):
         return "Rinnen", None
     if re.search(r"\bbogen\b|\babzweig\b|\bmuffe\b", text):
         return "Formstücke", None
@@ -266,6 +298,8 @@ _RELATED_CATEGORIES: dict[str, set[str]] = {
     "gasrohre": {"druckrohre"},
     "wasserrohre": {"druckrohre"},
     "druckrohre": {"gasrohre", "wasserrohre"},
+    "rinnen": {"strassenentwasserung"},
+    "strassenentwasserung": {"rinnen"},
 }
 
 
@@ -409,12 +443,13 @@ def _sn_score(required_sn: int | None, product: Product) -> tuple[float, list[st
 
     product_sn_str = (product.steifigkeitsklasse_sn or "").strip()
     if not product_sn_str:
-        return 0.0, []
+        # Position requires SN but product has no SN data — likely not suitable
+        return -15.0, [f"Keine SN-Angabe (SN{required_sn} gefordert)"]
 
     # Extract numeric SN value (e.g. "SN8" -> 8, "8" -> 8)
     sn_match = re.search(r"(\d+)", product_sn_str)
     if not sn_match:
-        return 0.0, []
+        return -15.0, [f"SN nicht lesbar (SN{required_sn} gefordert)"]
 
     product_sn = int(sn_match.group(1))
 
@@ -427,12 +462,63 @@ def _sn_score(required_sn: int | None, product: Product) -> tuple[float, list[st
     return -30.0, [f"SN{product_sn} unter Anforderung (SN{required_sn})"]
 
 
+def _pipe_length_score(required_mm: int | None, product: Product) -> tuple[float, list[str]]:
+    """Score based on pipe length match."""
+    if required_mm is None:
+        return 0.0, []
+    product_len = product.laenge_mm
+    if not product_len:
+        return 0.0, []
+    if product_len == required_mm:
+        return 8.0, [f"Baulänge {required_mm}mm exakt"]
+    # Close match (within 20%)
+    ratio = product_len / required_mm
+    if 0.8 <= ratio <= 1.2:
+        return 3.0, [f"Baulänge ähnlich ({product_len}mm ≈ {required_mm}mm)"]
+    return -5.0, [f"Baulänge abweichend ({product_len}mm ≠ {required_mm}mm)"]
+
+
+def _angle_score(required_deg: int | None, product: Product) -> tuple[float, list[str]]:
+    """Score based on fitting angle match (e.g. 45° Bogen)."""
+    if required_deg is None:
+        return 0.0, []
+    product_text = f"{product.artikelname} {product.artikelbeschreibung or ''}"
+    angle_match = re.search(r"(\d+)\s*(?:°|[Gg]rad)", product_text, re.IGNORECASE)
+    if not angle_match:
+        return 0.0, []
+    product_angle = int(angle_match.group(1))
+    if product_angle == required_deg:
+        return 10.0, [f"Winkel {required_deg}° exakt"]
+    return -15.0, [f"Winkel abweichend ({product_angle}° ≠ {required_deg}°)"]
+
+
+def _application_area_score(required_area: str | None, product: Product) -> tuple[float, list[str]]:
+    """Score based on application area match (Trinkwasser, Gas, Abwasser)."""
+    if not required_area:
+        return 0.0, []
+    product_area = (product.einsatzbereich or "").lower()
+    if not product_area:
+        return 0.0, []
+    required_lower = required_area.lower()
+    if required_lower in product_area or product_area in required_lower:
+        return 8.0, [f"Einsatzbereich passt ({product.einsatzbereich})"]
+    return -10.0, [f"Einsatzbereich abweichend ({product.einsatzbereich} ≠ {required_area})"]
+
+
 def _parse_dimensions(dim_str: str | None) -> tuple[int, ...]:
-    """Extract numeric dimensions from a string like '300/500', '500x500', '300x300mm'."""
+    """Extract numeric dimensions from a string like '300/500', '500x500', '300x300mm'.
+
+    Filters out numbers that look like DN values or load class designations to
+    avoid contaminating dimension comparisons.
+    """
     if not dim_str:
         return ()
-    nums = re.findall(r"(\d+)", dim_str)
-    return tuple(sorted(int(n) for n in nums))
+    # Remove DN, OD, SN references and load class designations before extracting
+    cleaned = re.sub(r"\bDN/?(?:OD)?\s*\d+", "", dim_str, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b[A-F]\d{2,3}\b", "", cleaned)  # load classes like D400
+    cleaned = re.sub(r"\bSN\s*\d+", "", cleaned, flags=re.IGNORECASE)
+    nums = re.findall(r"(\d+)", cleaned)
+    return tuple(sorted(int(n) for n in nums if int(n) > 1))
 
 
 def _dimensions_score(required_dims: str | None, product: Product) -> tuple[float, list[str]]:
@@ -554,8 +640,11 @@ def suggest_products_for_position(
         text_sc = _text_similarity_score(position_tokens, product)
         ptype_sc, ptype_reasons = _product_type_score(position_product_type, product)
         dims_sc, dims_reasons = _dimensions_score(position.parameters.dimensions, product)
+        length_sc, length_reasons = _pipe_length_score(position.parameters.pipe_length_mm, product)
+        angle_sc, angle_reasons = _angle_score(position.parameters.angle_deg, product)
+        app_sc, app_reasons = _application_area_score(position.parameters.application_area, product)
 
-        score += category_score + dn_sc + load_sc + material_sc + norm_sc + sn_sc + text_sc + ptype_sc + dims_sc
+        score += category_score + dn_sc + load_sc + material_sc + norm_sc + sn_sc + text_sc + ptype_sc + dims_sc + length_sc + angle_sc + app_sc
 
         reasons.extend(category_reasons)
         reasons.extend(dn_reasons)
@@ -565,6 +654,9 @@ def suggest_products_for_position(
         reasons.extend(sn_reasons)
         reasons.extend(ptype_reasons)
         reasons.extend(dims_reasons)
+        reasons.extend(length_reasons)
+        reasons.extend(angle_reasons)
+        reasons.extend(app_reasons)
 
         breakdown.append(ScoreBreakdown(component="Kategorie", points=round(category_score, 1), detail="; ".join(category_reasons) or "-"))
         breakdown.append(ScoreBreakdown(component="Produkttyp", points=round(ptype_sc, 1), detail="; ".join(ptype_reasons) or "-"))
@@ -575,6 +667,12 @@ def suggest_products_for_position(
         breakdown.append(ScoreBreakdown(component="SN-Klasse", points=round(sn_sc, 1), detail="; ".join(sn_reasons) or "-"))
         if dims_sc != 0:
             breakdown.append(ScoreBreakdown(component="Abmessungen", points=round(dims_sc, 1), detail="; ".join(dims_reasons) or "-"))
+        if length_sc != 0:
+            breakdown.append(ScoreBreakdown(component="Baulänge", points=round(length_sc, 1), detail="; ".join(length_reasons) or "-"))
+        if angle_sc != 0:
+            breakdown.append(ScoreBreakdown(component="Winkel", points=round(angle_sc, 1), detail="; ".join(angle_reasons) or "-"))
+        if app_sc != 0:
+            breakdown.append(ScoreBreakdown(component="Einsatzbereich", points=round(app_sc, 1), detail="; ".join(app_reasons) or "-"))
         breakdown.append(ScoreBreakdown(component="Textähnlichkeit", points=round(text_sc, 1), detail="-"))
 
         stock = product.lager_gesamt or 0
@@ -615,7 +713,8 @@ def suggest_products_for_position(
         if existing is None or s > existing[0]:
             grouped_by_id[key] = entry
 
-    min_score = 35.0 if category else 45.0
+    # Require category match + at least one technical parameter match to pass
+    min_score = 38.0 if category else 45.0
     final_candidates = [
         entry for entry in sorted(grouped_by_id.values(), key=lambda item: item[0], reverse=True) if entry[0] >= min_score
     ][:limit]

@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import Product
+from ..models import Product, Supplier
 
 
 ARTICLE_CSV_NAME = "TiefbauX_Dummy_Datenbank_v2.xlsx - Artikel.csv"
@@ -107,3 +107,59 @@ def seed_products_if_empty(db: Session) -> int:
     db.bulk_save_objects(products)
     db.commit()
     return len(products)
+
+
+_DEFAULT_SUPPLIERS = [
+    {
+        "name": "Wavin GmbH",
+        "email": "anfragen@wavin.com",
+        "phone": "+49 2831 1340",
+        "categories": '["Kanalrohre","Formstuecke","Schachtbauteile","Hausanschluss","Kabelschutz","Dichtungen & Zubehoer"]',
+    },
+    {
+        "name": "ACO Tiefbau",
+        "email": "anfragen@aco.de",
+        "phone": "+49 4621 3810",
+        "categories": '["Strassenentwässerung","Rinnen","Schachtabdeckungen"]',
+    },
+    {
+        "name": "Kann Baustoffwerke",
+        "email": "anfragen@kann.de",
+        "phone": "+49 2622 7070",
+        "categories": '["Pflastersteine","Bordsteine","Schachtbauteile"]',
+    },
+    {
+        "name": "Rehau AG",
+        "email": "anfragen@rehau.com",
+        "phone": "+49 9283 770",
+        "categories": '["Kanalrohre","Formstuecke","Hausanschluss"]',
+    },
+    {
+        "name": "Funke Kunststoffe GmbH",
+        "email": "anfragen@funke.de",
+        "phone": "+49 5731 2500",
+        "categories": '["Kanalrohre","Schachtbauteile","Formstuecke"]',
+    },
+    {
+        "name": "Mönninghoff GmbH",
+        "email": "anfragen@moenninghoff.de",
+        "phone": "+49 251 97400",
+        "categories": '["Kabelschutz"]',
+    },
+]
+
+
+def seed_suppliers_if_empty(db: Session) -> int:
+    existing = db.scalar(select(Supplier.id).limit(1))
+    if existing is not None:
+        return db.query(Supplier).count()
+
+    for s in _DEFAULT_SUPPLIERS:
+        db.add(Supplier(
+            name=s["name"],
+            email=s["email"],
+            phone=s.get("phone"),
+            categories_json=s.get("categories"),
+        ))
+    db.commit()
+    return len(_DEFAULT_SUPPLIERS)

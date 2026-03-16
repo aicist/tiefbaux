@@ -1,4 +1,4 @@
-import type { CompatibilityIssue, ExportPreviewResponse, LVPosition, ParseResponse, PositionSuggestions, ProductSearchResult, ProjectDetailResponse, ProjectSummary, SuggestionResponse } from './types'
+import type { CompatibilityIssue, ExportPreviewResponse, LVPosition, ParseResponse, PositionSuggestions, ProductSearchResult, ProjectDetailResponse, ProjectSummary, Supplier, SupplierInquiry, SuggestionResponse, TechnicalParameters } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000/api'
 
@@ -220,4 +220,70 @@ export async function recordOverride(data: {
 
 export function getProjectPdfUrl(projectId: number): string {
   return `${API_BASE}/projects/${projectId}/pdf`
+}
+
+// --- Supplier & Inquiry ---
+
+export async function fetchSuppliers(): Promise<Supplier[]> {
+  const response = await wrapFetch(fetch(`${API_BASE}/suppliers`))
+  return handleResponse<Supplier[]>(response)
+}
+
+export async function createSupplier(data: {
+  name: string
+  email: string
+  phone?: string
+  categories?: string[]
+  notes?: string
+}): Promise<Supplier> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/suppliers`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+  )
+  return handleResponse<Supplier>(response)
+}
+
+export async function createInquiry(data: {
+  supplier_id: number
+  project_id?: number | null
+  position_id?: string | null
+  ordnungszahl?: string | null
+  product_description: string
+  technical_params?: TechnicalParameters | null
+  quantity?: number | null
+  unit?: string | null
+  custom_message?: string | null
+  send_email?: boolean
+}): Promise<SupplierInquiry> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/inquiries`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+  )
+  return handleResponse<SupplierInquiry>(response)
+}
+
+export async function fetchInquiries(projectId?: number): Promise<SupplierInquiry[]> {
+  const params = projectId != null ? `?project_id=${projectId}` : ''
+  const response = await wrapFetch(fetch(`${API_BASE}/inquiries${params}`))
+  return handleResponse<SupplierInquiry[]>(response)
+}
+
+export async function updateInquiryStatus(
+  inquiryId: number,
+  status: string,
+  notes?: string,
+): Promise<void> {
+  await wrapFetch(
+    fetch(`${API_BASE}/inquiries/${inquiryId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status, notes }),
+    }),
+  )
 }

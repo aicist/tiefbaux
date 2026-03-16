@@ -165,3 +165,30 @@ export type UndoAction =
   | { type: 'deselect'; positionId: string; previousArticleId: string }
   | { type: 'skip'; positionId: string }
   | { type: 'unskip'; positionId: string }
+
+export type Supplier = {
+  id: number
+  name: string
+  email: string
+  phone?: string | null
+  categories: string[]
+  notes?: string | null
+  active: boolean
+}
+
+export type SupplierInquiry = {
+  id: number
+  supplier_name: string
+  supplier_email: string
+  project_id?: number | null
+  position_id?: string | null
+  ordnungszahl?: string | null
+  product_description: string
+  quantity?: number | null
+  unit?: string | null
+  status: 'offen' | 'angefragt' | 'angebot_erhalten'
+  sent_at?: string | null
+  email_subject?: string | null
+  email_body?: string | null
+  created_at: string
+}

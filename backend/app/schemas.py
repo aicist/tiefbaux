@@ -23,6 +23,9 @@ class TechnicalParameters(BaseModel):
     installation_area: str | None = None
     stiffness_class_sn: int | None = None
     sortiment_relevant: bool | None = None
+    pipe_length_mm: int | None = None
+    angle_deg: int | None = None
+    application_area: str | None = None
 
 
 class LVPosition(BaseModel):
@@ -214,3 +217,58 @@ class OverrideRequest(BaseModel):
     dn: int | None = None
     material: str | None = None
     chosen_artikel_id: str
+
+
+# --- Supplier & Inquiry ---
+
+class SupplierCreate(BaseModel):
+    name: str
+    email: str
+    phone: str | None = None
+    categories: list[str] = Field(default_factory=list)
+    notes: str | None = None
+
+
+class SupplierResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+    phone: str | None = None
+    categories: list[str] = Field(default_factory=list)
+    notes: str | None = None
+    active: bool
+
+
+class InquiryCreateRequest(BaseModel):
+    supplier_id: int
+    project_id: int | None = None
+    position_id: str | None = None
+    ordnungszahl: str | None = None
+    product_description: str
+    technical_params: TechnicalParameters | None = None
+    quantity: float | None = None
+    unit: str | None = None
+    custom_message: str | None = None
+    send_email: bool = True
+
+
+class InquiryResponse(BaseModel):
+    id: int
+    supplier_name: str
+    supplier_email: str
+    project_id: int | None = None
+    position_id: str | None = None
+    ordnungszahl: str | None = None
+    product_description: str
+    quantity: float | None = None
+    unit: str | None = None
+    status: str
+    sent_at: datetime | None = None
+    email_subject: str | None = None
+    email_body: str | None = None
+    created_at: datetime
+
+
+class InquiryStatusUpdate(BaseModel):
+    status: str
+    notes: str | None = None

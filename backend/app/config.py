@@ -33,6 +33,13 @@ class Settings:
     gemini_model: str
     cors_origins: list[str]
     project_root: Path
+    smtp_host: str | None
+    smtp_port: int
+    smtp_user: str | None
+    smtp_password: str | None
+    smtp_from_email: str | None
+    smtp_from_name: str
+    smtp_use_tls: bool
 
 
 def _split_csv_env(value: str | None, default: list[str]) -> list[str]:
@@ -61,6 +68,13 @@ def get_settings() -> Settings:
             ],
         ),
         project_root=_PROJECT_ROOT,
+        smtp_host=os.getenv("SMTP_HOST"),
+        smtp_port=int(os.getenv("SMTP_PORT", "587")),
+        smtp_user=os.getenv("SMTP_USER"),
+        smtp_password=os.getenv("SMTP_PASSWORD"),
+        smtp_from_email=os.getenv("SMTP_FROM_EMAIL"),
+        smtp_from_name=os.getenv("SMTP_FROM_NAME", "Fassbender Tenten GmbH"),
+        smtp_use_tls=os.getenv("SMTP_USE_TLS", "true").lower() in ("true", "1", "yes"),
     )
 
 

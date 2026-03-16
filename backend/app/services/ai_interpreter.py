@@ -35,6 +35,10 @@ CATEGORY_KEYWORDS: list[tuple[str, str, str | None]] = [
     ("abzweig", "Formstücke", None),
     ("muffe", "Formstücke", None),
     ("reduktion", "Formstücke", None),
+    ("schwerlastrinne", "Rinnen", "Schwerlastrinne"),
+    ("entwässerungsrinne", "Rinnen", "Entwässerungsrinne"),
+    ("entwasserungsrinne", "Rinnen", "Entwässerungsrinne"),
+    ("hofablauf", "Straßenentwässerung", "Hofablauf"),
     ("rinne", "Rinnen", "Entwässerungsrinne"),
     ("rost", "Rinnen", "Rinnenrost"),
     ("dichtung", "Dichtungen & Zubehör", "Rohrdichtung"),
@@ -56,9 +60,18 @@ MATERIAL_KEYWORDS = {
     "guss": "Gusseisen",
     "hdpe": "HDPE",
     "polyethylen": "HDPE",
-    "pe": "HDPE",
+    "pe-hd": "HDPE",
+    "pe 100": "HDPE",
+    "pe100": "HDPE",
+    "pe-rohr": "HDPE",
     "steinzeug": "Steinzeug",
 }
+
+# Keywords that need word-boundary matching (short strings prone to substring false-positives)
+_MATERIAL_REGEX_KEYWORDS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bpe\b", re.IGNORECASE), "HDPE"),
+    (re.compile(r"\bpp\b", re.IGNORECASE), "PP"),
+]
 
 LOAD_CLASSES = ("A15", "B125", "C250", "D400", "E600", "F900")
 SERVICE_KEYWORDS = (
@@ -79,7 +92,20 @@ SERVICE_KEYWORDS = (
 
 NORM_RE = re.compile(r"(DIN\s*(?:EN\s*)?\d+(?:-\d+)?)", re.IGNORECASE)
 DN_RE = re.compile(r"\bDN\s*([0-9]{2,4})\b", re.IGNORECASE)
-DIM_RE = re.compile(r"([0-9]{2,4}\s*[x/]|H\s*=\s*[0-9]{2,4}|Ø\s*[0-9]{2,4})", re.IGNORECASE)
+DIM_RE = re.compile(r"([0-9]{2,4}\s*x\s*[0-9]{2,4}|H\s*=\s*[0-9]{2,4}|Ø\s*[0-9]{2,4})", re.IGNORECASE)
+PIPE_LENGTH_RE = re.compile(
+    r"(?:baul[äa]nge|rohrl[äa]nge|l[äa]nge)[:\s]*(\d+)\s*(mm|m)\b",
+    re.IGNORECASE,
+)
+ANGLE_RE = re.compile(r"(\d+)\s*(?:°|[Gg]rad)")
+APPLICATION_KEYWORDS: dict[str, str] = {
+    "trinkwasser": "Trinkwasser",
+    "gas": "Gas",
+    "abwasser": "Abwasser",
+    "schmutzwasser": "Abwasser",
+    "regenwasser": "Regenwasser",
+    "mischwasser": "Abwasser",
+}
 
 
 class InterpretationError(Exception):
@@ -128,7 +154,19 @@ def _infer_with_heuristics(position: LVPosition) -> TechnicalParameters:
                 subcategory = subcategory_value
                 break
 
-    material = None if is_service_position else next((value for key, value in MATERIAL_KEYWORDS.items() if key in text), None)
+    material = None
+    if not is_service_position:
+        # Check longer/safer keywords first (substring match is fine for these)
+        for key, value in MATERIAL_KEYWORDS.items():
+            if key in text:
+                material = value
+                break
+        # Then check short keywords with word-boundary regex
+        if material is None:
+            for pattern, value in _MATERIAL_REGEX_KEYWORDS:
+                if pattern.search(text):
+                    material = value
+                    break
 
     dn_match = DN_RE.search(position.raw_text)
     load_class = next((klass for klass in LOAD_CLASSES if klass.lower() in text), None)
@@ -149,6 +187,27 @@ def _infer_with_heuristics(position: LVPosition) -> TechnicalParameters:
             reference = candidate
             break
 
+    # Pipe length extraction
+    pipe_length_mm = None
+    length_match = PIPE_LENGTH_RE.search(position.raw_text)
+    if length_match:
+        val = int(length_match.group(1))
+        unit_str = length_match.group(2).lower()
+        pipe_length_mm = val if unit_str == "mm" else val * 1000
+
+    # Angle extraction (for fittings: "45°", "30 Grad")
+    angle_deg = None
+    angle_match = ANGLE_RE.search(position.raw_text)
+    if angle_match:
+        angle_deg = int(angle_match.group(1))
+
+    # Application area
+    application_area = None
+    for kw, area_val in APPLICATION_KEYWORDS.items():
+        if kw in text:
+            application_area = area_val
+            break
+
     return TechnicalParameters(
         product_category=category,
         product_subcategory=subcategory,
@@ -161,6 +220,9 @@ def _infer_with_heuristics(position: LVPosition) -> TechnicalParameters:
         unit=position.unit,
         reference_product=reference,
         installation_area=install_area,
+        pipe_length_mm=pipe_length_mm,
+        angle_deg=angle_deg,
+        application_area=application_area,
     )
 
 
@@ -175,7 +237,10 @@ def _call_gemini_batch(positions: list[LVPosition]) -> list[dict[str, Any]]:
         "Jedes Objekt hat diese Keys: "
         "product_category, product_subcategory, material, nominal_diameter_dn (Integer oder null), "
         "load_class, norm, stiffness_class_sn (Integer oder null, z.B. 4/8/16 fuer SN4/SN8/SN16), "
-        "dimensions, color, reference_product, installation_area, sortiment_relevant. "
+        "dimensions, color, reference_product, installation_area, sortiment_relevant, "
+        "pipe_length_mm (Integer oder null, Baulaenge/Rohrlaenge in mm), "
+        "angle_deg (Integer oder null, Winkel bei Formstücken z.B. 15/30/45/67/87 Grad), "
+        "application_area (String oder null, z.B. Trinkwasser/Gas/Abwasser/Regenwasser). "
         "Verwende fuer product_category nur: Kanalrohre, Schachtabdeckungen, Schachtbauteile, "
         "Formstücke, Straßenentwässerung, Rinnen, Dichtungen & Zubehör. "
         "Setze null wenn ein Wert nicht erkennbar ist.\n\n"

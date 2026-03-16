@@ -108,6 +108,46 @@ class LVProjectPosition(Base):
     project = relationship("LVProject", back_populates="positions")
 
 
+class Supplier(Base):
+    __tablename__ = "suppliers"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(256), unique=True)
+    email: Mapped[str] = mapped_column(String(256))
+    phone: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    categories_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SupplierInquiry(Base):
+    __tablename__ = "supplier_inquiries"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), index=True)
+    project_id: Mapped[Optional[int]] = mapped_column(ForeignKey("lv_projects.id"), nullable=True, index=True)
+    position_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ordnungszahl: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    product_description: Mapped[str] = mapped_column(Text)
+    technical_params_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    quantity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    unit: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(32), default="offen")
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    email_subject: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    email_body: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    supplier = relationship("Supplier")
+    project = relationship("LVProject")
+
+
 class ManualOverride(Base):
     """Feature 6: Tracks manual product selections by employees for learning."""
     __tablename__ = "manual_overrides"

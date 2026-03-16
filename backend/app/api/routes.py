@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import LVProject, LVProjectPosition, ManualOverride, Product
+from ..models import LVProject, LVProjectPosition, ManualOverride, Product, Supplier, SupplierInquiry
 from ..schemas import (
     CompatibilityCheckRequest,
     CompatibilityIssue,
@@ -19,6 +19,9 @@ from ..schemas import (
     ExportPreviewResponse,
     ExportWarning,
     HealthResponse,
+    InquiryCreateRequest,
+    InquiryResponse,
+    InquiryStatusUpdate,
     LVPosition,
     OfferLine,
     OverrideRequest,
@@ -30,6 +33,8 @@ from ..schemas import (
     ProjectMetadata,
     ProjectSummary,
     SaveSelectionsRequest,
+    SupplierCreate,
+    SupplierResponse,
     SuggestionsRequest,
     SuggestionsResponse,
     TechnicalParameters,
@@ -599,3 +604,192 @@ def get_project_pdf(project_id: int, db: Session = Depends(get_db)):
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{project.filename or "lv.pdf"}"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# Supplier & Inquiry endpoints
+# ---------------------------------------------------------------------------
+
+
+def _supplier_to_response(s: Supplier) -> SupplierResponse:
+    import json as _json
+    cats: list[str] = []
+    if s.categories_json:
+        try:
+            cats = _json.loads(s.categories_json)
+        except Exception:
+            cats = []
+    return SupplierResponse(
+        id=s.id, name=s.name, email=s.email, phone=s.phone,
+        categories=cats, notes=s.notes, active=s.active,
+    )
+
+
+@router.get("/suppliers", response_model=list[SupplierResponse])
+def list_suppliers(db: Session = Depends(get_db)):
+    suppliers = db.execute(
+        select(Supplier).where(Supplier.active == True).order_by(Supplier.name)
+    ).scalars().all()
+    return [_supplier_to_response(s) for s in suppliers]
+
+
+@router.post("/suppliers", response_model=SupplierResponse)
+def create_supplier(data: SupplierCreate, db: Session = Depends(get_db)):
+    s = Supplier(
+        name=data.name, email=data.email, phone=data.phone,
+        categories_json=json.dumps(data.categories) if data.categories else None,
+        notes=data.notes,
+    )
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return _supplier_to_response(s)
+
+
+@router.put("/suppliers/{supplier_id}", response_model=SupplierResponse)
+def update_supplier(supplier_id: int, data: SupplierCreate, db: Session = Depends(get_db)):
+    s = db.get(Supplier, supplier_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Lieferant nicht gefunden")
+    s.name = data.name
+    s.email = data.email
+    s.phone = data.phone
+    s.categories_json = json.dumps(data.categories) if data.categories else None
+    s.notes = data.notes
+    db.commit()
+    db.refresh(s)
+    return _supplier_to_response(s)
+
+
+@router.delete("/suppliers/{supplier_id}")
+def delete_supplier(supplier_id: int, db: Session = Depends(get_db)):
+    s = db.get(Supplier, supplier_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Lieferant nicht gefunden")
+    s.active = False
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/inquiries", response_model=InquiryResponse)
+def create_inquiry(data: InquiryCreateRequest, db: Session = Depends(get_db)):
+    from ..services.email_service import build_inquiry_email, send_email
+
+    supplier = db.get(Supplier, data.supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=404, detail="Lieferant nicht gefunden")
+
+    # Get project name for email
+    project_name = None
+    if data.project_id:
+        project = db.get(LVProject, data.project_id)
+        if project:
+            project_name = project.bauvorhaben or project.project_name
+
+    params_dict = data.technical_params.model_dump(exclude_none=True) if data.technical_params else None
+
+    subject, body = build_inquiry_email(
+        product_description=data.product_description,
+        project_name=project_name,
+        technical_params=params_dict,
+        quantity=data.quantity,
+        unit=data.unit,
+        custom_message=data.custom_message,
+    )
+
+    status = "offen"
+    sent_at = None
+    if data.send_email:
+        sent = send_email(supplier.email, subject, body)
+        status = "angefragt"
+        if sent:
+            sent_at = datetime.utcnow()
+
+    inquiry = SupplierInquiry(
+        supplier_id=supplier.id,
+        project_id=data.project_id,
+        position_id=data.position_id,
+        ordnungszahl=data.ordnungszahl,
+        product_description=data.product_description,
+        technical_params_json=json.dumps(params_dict) if params_dict else None,
+        quantity=data.quantity,
+        unit=data.unit,
+        status=status,
+        sent_at=sent_at,
+        email_subject=subject,
+        email_body=body,
+    )
+    db.add(inquiry)
+    db.commit()
+    db.refresh(inquiry)
+
+    return InquiryResponse(
+        id=inquiry.id,
+        supplier_name=supplier.name,
+        supplier_email=supplier.email,
+        project_id=inquiry.project_id,
+        position_id=inquiry.position_id,
+        ordnungszahl=inquiry.ordnungszahl,
+        product_description=inquiry.product_description,
+        quantity=inquiry.quantity,
+        unit=inquiry.unit,
+        status=inquiry.status,
+        sent_at=inquiry.sent_at,
+        email_subject=inquiry.email_subject,
+        email_body=inquiry.email_body,
+        created_at=inquiry.created_at,
+    )
+
+
+@router.get("/inquiries", response_model=list[InquiryResponse])
+def list_inquiries(
+    project_id: int | None = None,
+    status: str | None = None,
+    db: Session = Depends(get_db),
+):
+    q = select(SupplierInquiry).join(Supplier)
+    if project_id is not None:
+        q = q.where(SupplierInquiry.project_id == project_id)
+    if status:
+        q = q.where(SupplierInquiry.status == status)
+    q = q.order_by(SupplierInquiry.created_at.desc())
+
+    inquiries = db.execute(q).scalars().all()
+    result = []
+    for inq in inquiries:
+        supplier = db.get(Supplier, inq.supplier_id)
+        result.append(InquiryResponse(
+            id=inq.id,
+            supplier_name=supplier.name if supplier else "?",
+            supplier_email=supplier.email if supplier else "",
+            project_id=inq.project_id,
+            position_id=inq.position_id,
+            ordnungszahl=inq.ordnungszahl,
+            product_description=inq.product_description,
+            quantity=inq.quantity,
+            unit=inq.unit,
+            status=inq.status,
+            sent_at=inq.sent_at,
+            email_subject=inq.email_subject,
+            email_body=inq.email_body,
+            created_at=inq.created_at,
+        ))
+    return result
+
+
+@router.patch("/inquiries/{inquiry_id}/status")
+def update_inquiry_status(
+    inquiry_id: int,
+    data: InquiryStatusUpdate,
+    db: Session = Depends(get_db),
+):
+    inq = db.get(SupplierInquiry, inquiry_id)
+    if not inq:
+        raise HTTPException(status_code=404, detail="Anfrage nicht gefunden")
+    if data.status not in ("offen", "angefragt", "angebot_erhalten"):
+        raise HTTPException(status_code=400, detail="Ungültiger Status")
+    inq.status = data.status
+    if data.notes is not None:
+        inq.notes = data.notes
+    db.commit()
+    return {"ok": True}

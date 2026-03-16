@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { CompatibilityIssue, LVPosition, PriceAdjustment, ProductSearchResult, ProductSuggestion, TechnicalParameters } from '../types'
 import { DinBadge } from './DinBadge'
+import { InquiryModal } from './InquiryModal'
 import { ParameterEditor } from './ParameterEditor'
 import { PriceAdjustmentControl } from './PriceAdjustmentControl'
 import { ProductSearchModal } from './ProductSearchModal'
@@ -41,6 +42,8 @@ type Props = {
   onParameterChange: (positionId: string, params: Partial<TechnicalParameters>) => void
   isRefreshingSuggestions: boolean
   onPriceAdjustmentChange: (positionId: string, adjustment: PriceAdjustment) => void
+  projectId?: number | null
+  projectName?: string | null
 }
 
 function formatMoney(value?: number | null, currency = 'EUR'): string {
@@ -74,10 +77,13 @@ export function SuggestionsPanel({
   compatibilityIssues,
   onParameterChange,
   isRefreshingSuggestions,
+  projectId,
+  projectName,
   onPriceAdjustmentChange,
 }: Props) {
   const [dismissedIds, setDismissedIds] = useState<Record<string, Set<string>>>({})
   const [searchOpen, setSearchOpen] = useState(false)
+  const [inquiryOpen, setInquiryOpen] = useState(false)
 
   const posId = activePosition?.id ?? ''
   const dismissed = dismissedIds[posId] ?? new Set()
@@ -155,6 +161,11 @@ export function SuggestionsPanel({
             <p>
               <button className="link-btn" onClick={() => setSearchOpen(true)}>
                 Katalog manuell durchsuchen
+              </button>
+            </p>
+            <p>
+              <button className="link-btn btn-inquiry" onClick={() => setInquiryOpen(true)}>
+                Lieferantenanfrage senden
               </button>
             </p>
           </div>
@@ -375,13 +386,22 @@ export function SuggestionsPanel({
       </div>
 
       {activePosition && (
-        <ProductSearchModal
-          isOpen={searchOpen}
-          onClose={() => setSearchOpen(false)}
-          onSelect={(product) => onManualSelect(activePosition.id, product)}
-          initialCategory={activePosition.parameters.product_category}
-          initialDn={activePosition.parameters.nominal_diameter_dn}
-        />
+        <>
+          <ProductSearchModal
+            isOpen={searchOpen}
+            onClose={() => setSearchOpen(false)}
+            onSelect={(product) => onManualSelect(activePosition.id, product)}
+            initialCategory={activePosition.parameters.product_category}
+            initialDn={activePosition.parameters.nominal_diameter_dn}
+          />
+          <InquiryModal
+            isOpen={inquiryOpen}
+            onClose={() => setInquiryOpen(false)}
+            position={activePosition}
+            projectId={projectId}
+            projectName={projectName}
+          />
+        </>
       )}
     </aside>
   )

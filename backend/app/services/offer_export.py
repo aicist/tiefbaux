@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 from datetime import datetime
 
 from reportlab.lib import colors
@@ -20,6 +21,13 @@ from reportlab.platypus import (
 )
 
 from ..schemas import ExportOfferMetadata, OfferLine
+
+# ── Company info ────────────────────────────────────────────────────
+COMPANY_NAME = "Faßbender Tenten GmbH & Co. KG"
+COMPANY_ADDRESS = "Bornheimer Str. 172–180 · 53119 Bonn"
+COMPANY_CONTACT = "Tel. 0228 / 64808-71 · info@fassbender-tenten.de"
+COMPANY_CITY = "Bonn"
+_LOGO_PATH = os.path.join(os.path.dirname(__file__), "..", "static", "logo_ft.jpg")
 
 # ── Colors ──────────────────────────────────────────────────────────
 DARK = colors.HexColor("#0F2B46")
@@ -81,16 +89,24 @@ def _draw_header_footer(canvas_obj: canvas.Canvas, doc, metadata: ExportOfferMet
     """Draw company header and footer on every page."""
     canvas_obj.saveState()
 
-    # ── Header: company info (right-aligned) ───
-    canvas_obj.setFont("Helvetica-Bold", 10)
-    canvas_obj.setFillColor(DARK)
+    # ── Header: logo (left) + company info (right-aligned) ───
     x_right = PAGE_W - R_MARGIN
     y_top = PAGE_H - 15 * mm
-    canvas_obj.drawRightString(x_right, y_top, "Mustermann Tiefbau GmbH")
+
+    # Logo — vertically centered with the company text block
+    logo = os.path.normpath(_LOGO_PATH)
+    if os.path.isfile(logo):
+        logo_h = 22 * mm
+        text_center_y = y_top - 11  # midpoint of the 3 text lines
+        canvas_obj.drawImage(logo, L_MARGIN, text_center_y - logo_h / 2, width=logo_h, height=logo_h, preserveAspectRatio=True, mask="auto")
+
+    canvas_obj.setFont("Helvetica-Bold", 10)
+    canvas_obj.setFillColor(DARK)
+    canvas_obj.drawRightString(x_right, y_top, COMPANY_NAME)
     canvas_obj.setFont("Helvetica", 8)
     canvas_obj.setFillColor(GRAY_600)
-    canvas_obj.drawRightString(x_right, y_top - 12, "Musterstraße 1 · 40000 Düsseldorf")
-    canvas_obj.drawRightString(x_right, y_top - 22, "Tel. 0211 12345-0 · info@mustermann-tiefbau.de")
+    canvas_obj.drawRightString(x_right, y_top - 12, COMPANY_ADDRESS)
+    canvas_obj.drawRightString(x_right, y_top - 22, COMPANY_CONTACT)
 
     # ── Header line ───
     canvas_obj.setStrokeColor(ACCENT)
@@ -101,14 +117,6 @@ def _draw_header_footer(canvas_obj: canvas.Canvas, doc, metadata: ExportOfferMet
     canvas_obj.setStrokeColor(GRAY_200)
     canvas_obj.setLineWidth(0.5)
     canvas_obj.line(L_MARGIN, B_MARGIN - 5 * mm, x_right, B_MARGIN - 5 * mm)
-
-    canvas_obj.setFont("Helvetica", 7)
-    canvas_obj.setFillColor(GRAY_400)
-    canvas_obj.drawString(
-        L_MARGIN,
-        12 * mm,
-        "Es gelten unsere allgemeinen Geschäftsbedingungen. Zahlungsziel: 30 Tage netto.",
-    )
 
     canvas_obj.restoreState()
 
@@ -236,7 +244,7 @@ def build_offer_pdf(lines: list[OfferLine], metadata: ExportOfferMetadata) -> by
     # ── Recipient address block ───
     story.append(
         Paragraph(
-            "Mustermann Tiefbau GmbH · Musterstraße 1 · 40000 Düsseldorf",
+            f"{COMPANY_NAME} · {COMPANY_ADDRESS}",
             styles["address_small"],
         )
     )
@@ -254,7 +262,7 @@ def build_offer_pdf(lines: list[OfferLine], metadata: ExportOfferMetadata) -> by
     date_str = metadata.created_at.strftime("%d.%m.%Y")
     offer_nr = metadata.created_at.strftime("A-%Y%m%d-%H%M")
     story.append(
-        Paragraph(f"Düsseldorf, {date_str}", styles["label"])
+        Paragraph(f"{COMPANY_CITY}, {date_str}", styles["label"])
     )
     story.append(Spacer(1, 5 * mm))
 
@@ -366,7 +374,7 @@ def build_offer_pdf(lines: list[OfferLine], metadata: ExportOfferMetadata) -> by
             "Wir freuen uns auf Ihre Rückmeldung und stehen für Rückfragen "
             "jederzeit gerne zur Verfügung.<br/><br/>"
             "Mit freundlichen Grüßen<br/>"
-            "Mustermann Tiefbau GmbH",
+            f"{COMPANY_NAME}",
             styles["body"],
         )
     )

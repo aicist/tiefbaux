@@ -156,4 +156,56 @@ def check_compatibility(selected: list[tuple[LVPosition, ProductSuggestion]]) ->
                 )
             )
 
+    # Rule: SN consistency — warn if position requires specific SN but selected product has lower SN.
+    for position, suggestion in selected:
+        req_sn = position.parameters.stiffness_class_sn
+        if req_sn is None:
+            continue
+        if suggestion.sn is None:
+            issues.append(
+                CompatibilityIssue(
+                    severity="WARNUNG",
+                    rule="SN-Klasse",
+                    message=(
+                        f"Position {position.ordnungszahl}: SN{req_sn} gefordert, "
+                        f"aber {suggestion.artikel_id} hat keine SN-Angabe."
+                    ),
+                    positions=[position.id],
+                )
+            )
+        elif suggestion.sn < req_sn:
+            issues.append(
+                CompatibilityIssue(
+                    severity="KRITISCH",
+                    rule="SN-Klasse",
+                    message=(
+                        f"Position {position.ordnungszahl}: SN{req_sn} gefordert, "
+                        f"aber {suggestion.artikel_id} hat nur SN{suggestion.sn}."
+                    ),
+                    positions=[position.id],
+                )
+            )
+
+    # Rule: Material consistency — warn if pipes and fittings use incompatible materials.
+    _PIPE_CATEGORIES = {"kanalrohre", "formstücke", "formstuecke"}
+    pipe_materials: dict[str, list[tuple[LVPosition, ProductSuggestion]]] = defaultdict(list)
+    for position, suggestion in selected:
+        cat = (suggestion.category or "").lower()
+        if cat not in _PIPE_CATEGORIES:
+            continue
+        mat = (position.parameters.material or "").lower().strip()
+        if mat:
+            pipe_materials[mat].append((position, suggestion))
+    if len(pipe_materials) > 1:
+        mat_labels = sorted(pipe_materials.keys())
+        all_pos_ids = [p.id for entries in pipe_materials.values() for p, _ in entries]
+        issues.append(
+            CompatibilityIssue(
+                severity="WARNUNG",
+                rule="Werkstoff konsistent",
+                message=f"Unterschiedliche Werkstoffe bei Rohren/Formstücken: {', '.join(mat_labels)}. Systemkompatibilität prüfen.",
+                positions=all_pos_ids,
+            )
+        )
+
     return issues

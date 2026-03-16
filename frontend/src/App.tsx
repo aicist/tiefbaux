@@ -67,6 +67,8 @@ function App() {
                 onPriceAdjustmentChange={analysis.handlePriceAdjustmentChange}
                 onFinish={analysis.handleExportPreview}
                 onBackToOverview={() => setAssignmentMode(false)}
+                projectId={analysis.projectId}
+                projectName={analysis.projectName}
               />
             </>
           ) : (
@@ -141,6 +143,8 @@ function App() {
                   onParameterChange={analysis.handleParameterChange}
                   isRefreshingSuggestions={analysis.isRefreshingSuggestions}
                   onPriceAdjustmentChange={analysis.handlePriceAdjustmentChange}
+                  projectId={analysis.projectId}
+                  projectName={analysis.projectName}
                 />
               </section>
 

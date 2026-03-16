@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { LVPosition, PriceAdjustment, ProductSearchResult, ProductSuggestion } from '../types'
 import { DinBadge } from './DinBadge'
+import { InquiryModal } from './InquiryModal'
 import { PriceAdjustmentControl } from './PriceAdjustmentControl'
 import { ProductSearchModal } from './ProductSearchModal'
 import { computeAdjustedTotal, computeAdjustedUnitPrice, isAdjustedPrice } from '../utils/pricing'
@@ -66,6 +67,8 @@ type Props = {
   onPriceAdjustmentChange: (positionId: string, adjustment: PriceAdjustment) => void
   onFinish: () => void
   onBackToOverview: () => void
+  projectId?: number | null
+  projectName?: string | null
 }
 
 export function AssignmentView({
@@ -80,10 +83,13 @@ export function AssignmentView({
   onPriceAdjustmentChange,
   onFinish,
   onBackToOverview,
+  projectId,
+  projectName,
 }: Props) {
   const [currentIndex, setCurrentIndex] = useState(0)
   const [decisions, setDecisions] = useState<Record<string, AssignmentDecision>>({})
   const [searchOpen, setSearchOpen] = useState(false)
+  const [inquiryOpen, setInquiryOpen] = useState(false)
   const [slideDirection, setSlideDirection] = useState<'left' | 'right' | null>(null)
   const [activeFilter, setActiveFilter] = useState<FilterTab>('alle')
 
@@ -403,6 +409,21 @@ export function AssignmentView({
                 <span className="param-chip quantity">{currentPosition.quantity} {currentPosition.unit}</span>
               )}
             </div>
+            {currentSelectedArticle && (() => {
+              const selectedArt = currentSuggestions.find(s => s.artikel_id === currentSelectedArticle)
+              return selectedArt ? (
+                <>
+                  <hr className="selected-article-divider" />
+                  <div className="position-selected-article">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                      <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    <span>{selectedArt.artikelname}</span>
+                    <span style={{ color: 'var(--ink-400)', fontSize: '0.65rem' }}>{selectedArt.artikel_id}</span>
+                  </div>
+                </>
+              ) : null
+            })()}
             {isServiceView && (
               <div className="service-badge-info">Dienstleistung — nicht im Angebot enthalten</div>
             )}
@@ -462,6 +483,12 @@ export function AssignmentView({
                     <path d="M21 21l-4.35-4.35" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
                   </svg>
                   Manuell suchen
+                </button>
+                <button className="btn btn-ghost btn-inquiry" onClick={() => setInquiryOpen(true)}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                    <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  Lieferantenanfrage
                 </button>
               </div>
             </div>
@@ -539,13 +566,22 @@ export function AssignmentView({
 
       {/* Product search modal */}
       {currentPosition && (
-        <ProductSearchModal
-          isOpen={searchOpen}
-          onClose={() => setSearchOpen(false)}
-          onSelect={handleManualSearchSelect}
-          initialCategory={currentPosition.parameters.product_category}
-          initialDn={currentPosition.parameters.nominal_diameter_dn}
-        />
+        <>
+          <ProductSearchModal
+            isOpen={searchOpen}
+            onClose={() => setSearchOpen(false)}
+            onSelect={handleManualSearchSelect}
+            initialCategory={currentPosition.parameters.product_category}
+            initialDn={currentPosition.parameters.nominal_diameter_dn}
+          />
+          <InquiryModal
+            isOpen={inquiryOpen}
+            onClose={() => setInquiryOpen(false)}
+            position={currentPosition}
+            projectId={projectId}
+            projectName={projectName}
+          />
+        </>
       )}
     </div>
   )
