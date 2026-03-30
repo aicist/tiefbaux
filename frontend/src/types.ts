@@ -1,10 +1,17 @@
 export type ComponentRequirement = {
   component_name: string
+  description?: string | null
   product_category?: string | null
   product_subcategory?: string | null
   nominal_diameter_dn?: number | null
+  secondary_nominal_diameter_dn?: number | null
   quantity: number
   material?: string | null
+  system_family?: string | null
+  load_class?: string | null
+  dimensions?: string | null
+  connection_type?: string | null
+  installation_area?: string | null
 }
 
 export type TechnicalParameters = {
@@ -12,6 +19,7 @@ export type TechnicalParameters = {
   product_subcategory?: string | null
   material?: string | null
   nominal_diameter_dn?: number | null
+  secondary_nominal_diameter_dn?: number | null
   load_class?: string | null
   norm?: string | null
   dimensions?: string | null
@@ -22,6 +30,13 @@ export type TechnicalParameters = {
   installation_area?: string | null
   stiffness_class_sn?: number | null
   sortiment_relevant?: boolean | null
+  pipe_length_mm?: number | null
+  angle_deg?: number | null
+  application_area?: string | null
+  system_family?: string | null
+  connection_type?: string | null
+  seal_type?: string | null
+  compatible_systems?: string[] | null
   components?: ComponentRequirement[] | null
 }
 
@@ -66,6 +81,9 @@ export type ProductSuggestion = {
   score_breakdown: ScoreBreakdown[]
   is_manual?: boolean
   is_override?: boolean
+  is_supplier_offer?: boolean
+  supplier_offer_id?: number | null
+  supplier_name?: string | null
 }
 
 export type ComponentSuggestions = {
@@ -147,9 +165,22 @@ export type ProductSearchResult = {
   werkstoff?: string | null
 }
 
+export type ProductSearchResponse = {
+  items: ProductSearchResult[]
+  has_more: boolean
+}
+
 export type AnalysisStep = 'idle' | 'uploading' | 'parsing' | 'enriching' | 'matching' | 'done' | 'error'
 
-export type AppView = 'analysis' | 'archive' | 'radar'
+export type AppView = 'analysis' | 'archive' | 'radar' | 'admin'
+
+export type User = {
+  id: number
+  email: string
+  name: string
+  role: 'admin' | 'mitarbeiter'
+  active: boolean
+}
 
 export type ProjectSummary = {
   id: number
@@ -164,6 +195,17 @@ export type ProjectSummary = {
   objekt_nr?: string | null
   submission_date?: string | null
   kunde_name?: string | null
+  status?: 'neu' | 'offen' | 'anfrage_offen' | 'gerechnet' | string
+  offer_pdf_path?: string | null
+  assigned_user_name?: string | null
+  last_editor_name?: string | null
+  last_edited_at?: string | null
+}
+
+export type AssignmentUiState = {
+  active_filter: 'alle' | 'zugeordnet' | 'offen' | 'dienstleistung'
+  current_position_id?: string | null
+  is_finished?: boolean
 }
 
 export type ProjectDetailResponse = {
@@ -171,13 +213,14 @@ export type ProjectDetailResponse = {
   positions: LVPosition[]
   metadata?: ProjectMetadata | null
   selections?: Record<string, string[]> | null
+  decisions?: Record<string, 'accepted' | 'rejected' | 'inquiry_pending'> | null
+  component_selections?: Record<string, string> | null
+  ui_state?: AssignmentUiState | null
 }
 
 export type UndoAction =
   | { type: 'select'; positionId: string; previousArticleIds: string[] | undefined }
   | { type: 'deselect'; positionId: string; previousArticleIds: string[] }
-  | { type: 'skip'; positionId: string }
-  | { type: 'unskip'; positionId: string }
 
 export type Supplier = {
   id: number
@@ -210,6 +253,7 @@ export type Tender = {
 
 export type SupplierInquiry = {
   id: number
+  supplier_id: number
   supplier_name: string
   supplier_email: string
   project_id?: number | null
@@ -222,5 +266,62 @@ export type SupplierInquiry = {
   sent_at?: string | null
   email_subject?: string | null
   email_body?: string | null
+  notes?: string | null
   created_at: string
+}
+
+export type SupplierOffer = {
+  id: number
+  inquiry_id?: number | null
+  supplier_id: number
+  supplier_name: string
+  project_id?: number | null
+  position_id?: string | null
+  ordnungszahl?: string | null
+  article_name: string
+  article_number?: string | null
+  unit_price?: number | null
+  total_price?: number | null
+  delivery_days?: number | null
+  quantity?: number | null
+  unit?: string | null
+  notes?: string | null
+  source: 'manual' | 'email_auto' | 'pdf_import'
+  status: 'neu' | 'zugeordnet' | 'abgelehnt'
+  created_at: string
+}
+
+export type BundledEmailPreview = {
+  supplier_id: number
+  supplier_name: string
+  supplier_email: string
+  subject: string
+  body: string
+  inquiry_ids: number[]
+  positions: Array<{
+    ordnungszahl?: string | null
+    product_description: string
+    quantity?: number | null
+    unit?: string | null
+  }>
+}
+
+export type InboxSyncResult = {
+  status: string
+  mailbox?: string
+  processed_count?: number
+  ignored_count?: number
+  new_lv_created?: number
+  new_lv_skipped?: number
+  offers_matched?: number
+  offers_unmatched?: number
+  detail?: string
+  errors?: string[]
+}
+
+export type InboxSyncStatus = {
+  running: boolean
+  last_started_at?: string | null
+  last_finished_at?: string | null
+  last_result?: InboxSyncResult | null
 }

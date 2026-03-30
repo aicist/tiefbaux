@@ -5,6 +5,7 @@ import re
 from collections.abc import Iterable
 
 import pdfplumber
+from pypdf import PdfReader
 
 from ..schemas import LVPosition
 
@@ -114,8 +115,18 @@ def _extract_quantity(text: str) -> tuple[float | None, str | None]:
 
 def _extract_pdf_lines(pdf_bytes: bytes) -> list[str]:
     lines: list[str] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                for raw_line in page_text.splitlines():
+                    line = _normalize_line(raw_line)
+                    if _is_header_or_noise(line):
+                        continue
+                    lines.append(line)
+    except Exception:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
             page_text = page.extract_text() or ""
             for raw_line in page_text.splitlines():
                 line = _normalize_line(raw_line)
@@ -152,6 +163,56 @@ def _collect_position_blocks(lines: Iterable[str]) -> list[dict[str, object]]:
     return blocks
 
 
+def _position_completeness_score(position: LVPosition) -> tuple[int, int, int]:
+    """Rank duplicate OZ matches by how much usable signal they contain."""
+    return (
+        1 if position.quantity is not None else 0,
+        len(position.raw_text or ""),
+        len(position.description or ""),
+    )
+
+
+def _deduplicate_positions(positions: list[LVPosition]) -> list[LVPosition]:
+    """Keep one stable position per OZ for regex/pdf fallback parsing.
+
+    Some PDFs extracted via pypdf repeat the same visible content twice.
+    OZs should be unique inside an LV, so we keep the most complete entry
+    and merge missing scalar fields from duplicate occurrences.
+    """
+    seen: dict[str, LVPosition] = {}
+    ordered: list[str] = []
+
+    for position in positions:
+        oz = position.ordnungszahl
+        if oz not in seen:
+            seen[oz] = position
+            ordered.append(oz)
+            continue
+
+        existing = seen[oz]
+        preferred = existing
+        other = position
+        if _position_completeness_score(position) > _position_completeness_score(existing):
+            preferred = position
+            other = existing
+
+        updates: dict[str, object] = {}
+        if not preferred.description and other.description:
+            updates["description"] = other.description
+        if not preferred.raw_text and other.raw_text:
+            updates["raw_text"] = other.raw_text
+        if preferred.quantity is None and other.quantity is not None:
+            updates["quantity"] = other.quantity
+        if preferred.unit is None and other.unit is not None:
+            updates["unit"] = other.unit
+        if not preferred.billable and other.billable:
+            updates["billable"] = other.billable
+
+        seen[oz] = preferred.model_copy(update=updates) if updates else preferred
+
+    return [seen[oz] for oz in ordered]
+
+
 def extract_positions_from_pdf(pdf_bytes: bytes) -> list[LVPosition]:
     lines = _extract_pdf_lines(pdf_bytes)
     blocks = _collect_position_blocks(lines)
@@ -174,10 +235,11 @@ def extract_positions_from_pdf(pdf_bytes: bytes) -> list[LVPosition]:
         description = text_lines[0]
         quantity, unit = _extract_quantity(raw_text)
 
-        depth = ordnungszahl.count(".") + 1
         non_billable_markers = ("allgemeine beschreibung", "vorbemerkungen")
         marker_hit = any(marker in description.lower() for marker in non_billable_markers)
-        billable = bool(quantity is not None and depth >= 3 and not marker_hit)
+        # Many LVs use billable OZs like "04.0010" with only one dot segment.
+        # Requiring depth >= 3 incorrectly drops complete material sections.
+        billable = bool(quantity is not None and not marker_hit)
 
         positions.append(
             LVPosition(
@@ -190,6 +252,8 @@ def extract_positions_from_pdf(pdf_bytes: bytes) -> list[LVPosition]:
                 billable=billable,
             )
         )
+
+    positions = _deduplicate_positions(positions)
 
     # Keep only billable positions, but if parser fails keep up to first 40 positions as fallback.
     billable_positions = [position for position in positions if position.billable]

@@ -1,9 +1,16 @@
 import { useCallback, useEffect, useState } from 'react'
-import { deleteProject, fetchProjects, getProjectPdfUrl } from '../api'
+import { deleteProject, fetchProjects } from '../api'
 import type { ProjectSummary } from '../types'
 
 type Props = {
   onLoadProject: (projectId: number) => void
+}
+
+function statusLabel(status?: string): string {
+  if (status === 'gerechnet') return 'Gerechnet'
+  if (status === 'anfrage_offen') return 'Anfrage offen'
+  if (status === 'offen') return 'Offen'
+  return 'Neu'
 }
 
 export function ProjectArchive({ onLoadProject }: Props) {
@@ -90,12 +97,12 @@ export function ProjectArchive({ onLoadProject }: Props) {
                   {project.projekt_nr && (
                     <span className="archive-objnr">{project.projekt_nr}</span>
                   )}
+                  <span className={`archive-status archive-status-${project.status ?? 'neu'}`}>
+                    {statusLabel(project.status)}
+                  </span>
                   <span className="archive-filename">
                     {project.bauvorhaben ?? project.filename ?? 'Unbenannt'}
                   </span>
-                  {project.objekt_nr && (
-                    <span className="archive-lv-nr">{project.objekt_nr}</span>
-                  )}
                 </div>
                 <div className="archive-meta-row">
                   {project.kunde_name && (
@@ -112,6 +119,27 @@ export function ProjectArchive({ onLoadProject }: Props) {
                     })}
                   </span>
                 </div>
+                {(project.assigned_user_name || project.last_editor_name) && (
+                  <div className="archive-user-row">
+                    {project.assigned_user_name && (
+                      <span className="archive-assigned">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                          <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2" stroke="currentColor" strokeWidth="2" />
+                          <circle cx="12" cy="7" r="4" stroke="currentColor" strokeWidth="2" />
+                        </svg>
+                        Zugewiesen: {project.assigned_user_name}
+                      </span>
+                    )}
+                    {project.last_editor_name && (
+                      <span className="archive-editor">
+                        Zuletzt: {project.last_editor_name}
+                        {project.last_edited_at && (
+                          <>, {new Date(project.last_edited_at).toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: '2-digit' })}</>
+                        )}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
               <div className="archive-stats">
                 <span>{project.total_positions} Pos.</span>
@@ -123,21 +151,8 @@ export function ProjectArchive({ onLoadProject }: Props) {
                   className="btn-archive-load"
                   onClick={() => onLoadProject(project.id)}
                 >
-                  Analyse laden
+                  {project.status === 'gerechnet' ? 'Projekt ansehen' : 'Analyse laden'}
                 </button>
-                <a
-                  className="btn-archive-pdf"
-                  href={getProjectPdfUrl(project.id)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  title="Original-LV anzeigen"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" stroke="currentColor" strokeWidth="1.5" />
-                    <polyline points="14,2 14,8 20,8" stroke="currentColor" strokeWidth="1.5" />
-                  </svg>
-                  LV
-                </a>
                 <button
                   className="btn-archive-delete"
                   onClick={() => handleDelete(project)}

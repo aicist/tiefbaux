@@ -1,49 +1,118 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Component, useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 import { getProjectPdfUrl } from './api'
+import { AdminPanel } from './components/AdminPanel'
 import { AssignmentView } from './components/AssignmentView'
 import { ExportConfirmDialog } from './components/ExportConfirmDialog'
 import { Header } from './components/Header'
+import { InquiryPanel } from './components/InquiryPanel'
+import { LoginScreen } from './components/LoginScreen'
 import { PositionsList } from './components/PositionsList'
 import { ProgressOverlay } from './components/ProgressOverlay'
 import { ProjectArchive } from './components/ProjectArchive'
+import { ProjectOverview } from './components/ProjectOverview'
 import { TenderRadar } from './components/TenderRadar'
 import { ProjectHeader } from './components/ProjectHeader'
 import { StatsBar } from './components/StatsBar'
 import { SuggestionsPanel } from './components/SuggestionsPanel'
 import { UploadPanel } from './components/UploadPanel'
 import { useAnalysis } from './hooks/useAnalysis'
-import type { AppView } from './types'
+import { useAuth } from './hooks/useAuth'
+import type { AppView, User } from './types'
+import { primaryAssignmentKey } from './utils/assignmentKeys'
 
-function App() {
+type ErrorBoundaryProps = { children: React.ReactNode }
+type ErrorBoundaryState = { error: Error | null }
+
+class AppErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error }
+  }
+
+  componentDidCatch(error: Error): void {
+    // Keep console output for debugging runtime crashes in development.
+    console.error('Runtime error in app shell:', error)
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="app-error-screen">
+          <div className="app-error-card">
+            <h2>Frontend-Fehler</h2>
+            <p>Die Seite konnte nicht korrekt gerendert werden.</p>
+            <pre>{this.state.error.message}</pre>
+            <button
+              className="btn btn-primary"
+              onClick={() => window.location.reload()}
+            >
+              Seite neu laden
+            </button>
+          </div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
+function AuthenticatedApp({ user, isAdmin, onLogout }: { user: User; isAdmin: boolean; onLogout: () => void }) {
   const analysis = useAnalysis()
   const [activeView, setActiveView] = useState<AppView>('analysis')
   const [assignmentMode, setAssignmentMode] = useState(false)
   const prevStepRef = useRef(analysis.step)
 
-  // Auto-enter assignment mode when analysis completes
+  // Auto-enter assignment mode when analysis completes (not for read-only)
   useEffect(() => {
-    if (prevStepRef.current !== 'done' && analysis.step === 'done') {
+    if (prevStepRef.current !== 'done' && analysis.step === 'done' && !analysis.isReadOnly) {
       setAssignmentMode(true)
     }
     prevStepRef.current = analysis.step
-  }, [analysis.step])
+  }, [analysis.step, analysis.isReadOnly])
 
   const handleLoadFromArchive = useCallback((projectId: number) => {
     setActiveView('analysis')
     analysis.handleLoadProject(projectId)
   }, [analysis.handleLoadProject])
 
+  const handleEditPosition = useCallback((positionId: string) => {
+    analysis.handleAssignmentUiStateChange({ ...analysis.assignmentUiState, current_position_id: positionId })
+    setAssignmentMode(true)
+  }, [analysis.assignmentUiState, analysis.handleAssignmentUiStateChange])
+
   const hasResults = analysis.step === 'done'
 
   return (
     <main className="app-shell">
-      <Header activeView={activeView} onViewChange={setActiveView} />
+      <Header
+        activeView={activeView}
+        onViewChange={setActiveView}
+        user={user}
+        onLogout={onLogout}
+      />
 
       {activeView === 'analysis' ? (
         <>
-          {/* Assignment mode: focused widget-based workflow */}
-          {assignmentMode && hasResults ? (
+          {/* Read-only mode for completed projects */}
+          {analysis.isReadOnly && hasResults && analysis.projectId ? (
+            <ProjectOverview
+              metadata={analysis.metadata}
+              projectId={analysis.projectId}
+              projectName={analysis.projectName}
+              projectStatus={analysis.projectUserInfo.status}
+              offerPdfPath={analysis.projectUserInfo.offer_pdf_path}
+              positions={analysis.positions}
+              onBack={() => { analysis.handleReset(); setAssignmentMode(false); setActiveView('archive') }}
+              lastEditorName={analysis.projectUserInfo.last_editor_name}
+              lastEditedAt={analysis.projectUserInfo.last_edited_at}
+              assignedUserName={analysis.projectUserInfo.assigned_user_name}
+              suggestionMap={analysis.suggestionMap}
+              selectedArticleIds={analysis.selectedArticleIds}
+              decisions={analysis.positionDecisions}
+            />
+          ) : assignmentMode && hasResults ? (
             <>
               {analysis.metadata && (
                 <ProjectHeader metadata={analysis.metadata} />
@@ -52,11 +121,12 @@ function App() {
                 positions={analysis.positions}
                 suggestionMap={analysis.suggestionMap}
                 selectedArticleIds={analysis.selectedArticleIds}
-                skippedPositionIds={analysis.skippedPositionIds}
+                decisions={analysis.positionDecisions}
+                onDecisionChange={analysis.handleSetPositionDecision}
                 priceAdjustments={analysis.priceAdjustments}
                 categoryAdjustments={analysis.categoryAdjustments}
                 onAccept={analysis.handleSuggestionSelect}
-                onSwapPrimary={analysis.handleSwapPrimary}
+                onSilentSelect={analysis.handleSilentSelect}
                 onReject={analysis.handleRejectSuggestion}
                 onManualSelect={analysis.handleManualSelect}
                 onAddArticle={analysis.handleAddArticle}
@@ -73,6 +143,10 @@ function App() {
                 positionSuggestions={analysis.positionSuggestions}
                 componentSelections={analysis.componentSelections}
                 onComponentSelect={analysis.handleComponentSelect}
+                onComponentManualSelect={analysis.handleComponentManualSelect}
+                persistedUiState={analysis.assignmentUiState}
+                onUiStateChange={analysis.handleAssignmentUiStateChange}
+                onRefreshInquiries={analysis.handleRefreshInquiries}
               />
             </>
           ) : (
@@ -128,25 +202,41 @@ function App() {
                   activePositionId={analysis.activePositionId}
                   onSelectPosition={analysis.setActivePositionId}
                   selectedArticleIds={analysis.selectedArticleIds}
+                  positionDecisions={analysis.positionDecisions}
+                  pendingInquiryPositionIds={analysis.pendingInquiryPositionIds}
+                  componentSelections={analysis.componentSelections}
                   suggestionMap={analysis.suggestionMap}
-                  skippedPositionIds={analysis.skippedPositionIds}
-                  onToggleSkip={analysis.handleToggleSkip}
+                  positionSuggestions={analysis.positionSuggestions}
                   onEnterAssignment={hasResults ? () => setAssignmentMode(true) : undefined}
+                  showAssignmentDetails={hasResults && Boolean(analysis.projectId)}
+                  inquiries={analysis.inquiries}
+                  onEditPosition={hasResults ? handleEditPosition : undefined}
                 />
 
-                <SuggestionsPanel
-                  activePosition={analysis.activePosition}
-                  suggestions={analysis.activeSuggestions}
-                  selectedArticleIds={analysis.activePosition ? analysis.selectedArticleIds[analysis.activePosition.id] ?? [] : []}
-                  priceAdjustment={analysis.activePosition ? analysis.priceAdjustments[analysis.activePosition.id] : undefined}
-                  onSelectArticle={analysis.handleSuggestionSelect}
-                  onManualSelect={analysis.handleManualSelect}
-                  onParameterChange={analysis.handleParameterChange}
-                  isRefreshingSuggestions={analysis.isRefreshingSuggestions}
-                  onPriceAdjustmentChange={analysis.handlePriceAdjustmentChange}
-                  projectId={analysis.projectId}
-                  projectName={analysis.projectName}
-                />
+                {analysis.projectId ? (
+                  <InquiryPanel
+                    inquiries={analysis.inquiries}
+                    positions={analysis.positions}
+                    projectId={analysis.projectId}
+                    onRefreshInquiries={analysis.handleRefreshInquiries}
+                    onEditPosition={handleEditPosition}
+                  />
+                ) : (
+                  <SuggestionsPanel
+                    activePosition={analysis.activePosition}
+                    suggestions={analysis.activeSuggestions}
+                    componentSuggestions={analysis.activePosition ? analysis.positionSuggestions.find((ps) => ps.position_id === analysis.activePosition?.id)?.component_suggestions ?? null : null}
+                    selectedArticleIds={analysis.activePosition ? analysis.selectedArticleIds[analysis.activePosition.id] ?? [] : []}
+                    priceAdjustment={analysis.activePosition ? analysis.priceAdjustments[primaryAssignmentKey(analysis.activePosition.id)] : undefined}
+                    onSelectArticle={analysis.handleSuggestionSelect}
+                    onManualSelect={analysis.handleManualSelect}
+                    onParameterChange={analysis.handleParameterChange}
+                    isRefreshingSuggestions={analysis.isRefreshingSuggestions}
+                    onPriceAdjustmentChange={analysis.handlePriceAdjustmentChange}
+                    projectId={analysis.projectId}
+                    projectName={analysis.projectName}
+                  />
+                )}
               </section>
 
               {analysis.showPdfViewer && analysis.projectId && (
@@ -184,6 +274,8 @@ function App() {
         </>
       ) : activeView === 'radar' ? (
         <TenderRadar />
+      ) : activeView === 'admin' && isAdmin ? (
+        <AdminPanel />
       ) : (
         <ProjectArchive onLoadProject={handleLoadFromArchive} />
       )}
@@ -199,6 +291,30 @@ function App() {
         </div>
       )}
     </main>
+  )
+}
+
+function App() {
+  const auth = useAuth()
+
+  return (
+    <AppErrorBoundary>
+      {auth.isLoading ? (
+        <div className="app-loading">
+          <div className="spinner" />
+          <div className="app-loading-text">Anwendung wird geladen...</div>
+        </div>
+      ) : !auth.user ? (
+        <LoginScreen onLogin={auth.login} />
+      ) : (
+        <AuthenticatedApp
+          key={auth.user.id}
+          user={auth.user}
+          isAdmin={auth.isAdmin}
+          onLogout={auth.logout}
+        />
+      )}
+    </AppErrorBoundary>
   )
 }
 

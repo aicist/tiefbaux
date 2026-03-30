@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ApiError, exportOffer, fetchExportPreview, fetchProject, fetchSingleSuggestions, fetchSuggestions, parseLV, recordOverride, saveSelections } from '../api'
+import { ApiError, cleanupOpenInquiriesForPosition, exportOffer, fetchExportPreview, fetchInquiries, fetchProject, fetchSingleSuggestions, fetchSuggestions, parseLV, recordOverride, saveSelections, saveWorkstate } from '../api'
 import type {
+  AssignmentUiState,
   AnalysisStep,
   DuplicateInfo,
   ExportPreviewResponse,
@@ -10,10 +11,116 @@ import type {
   ProductSearchResult,
   ProductSuggestion,
   ProjectMetadata,
+  SupplierInquiry,
+  ScoreBreakdown,
   TechnicalParameters,
   UndoAction,
 } from '../types'
 import { computeAdjustedTotal, computeAdjustedUnitPrice, isAdjustedPrice } from '../utils/pricing'
+import { additionalAssignmentKey, componentAssignmentKey, componentSelectionKey, primaryAssignmentKey } from '../utils/assignmentKeys'
+
+function normalizeText(value?: string | null): string {
+  return (value ?? '').trim().toLowerCase()
+}
+
+const DEFAULT_ASSIGNMENT_UI_STATE: AssignmentUiState = {
+  active_filter: 'alle',
+  current_position_id: null,
+  is_finished: false,
+}
+
+function buildManualComparison(
+  position: LVPosition | undefined,
+  product: ProductSearchResult,
+  mode: 'manual' | 'additional',
+): {
+  reasons: string[]
+  warnings: string[]
+  scoreBreakdown: ScoreBreakdown[]
+} {
+  const reasons: string[] = [mode === 'manual' ? 'Manuell gewählt' : 'Zusatzartikel']
+  const warnings: string[] = []
+  const scoreBreakdown: ScoreBreakdown[] = []
+
+  if (!position) return { reasons, warnings, scoreBreakdown }
+
+  const params = position.parameters
+  const productCategory = normalizeText(product.kategorie)
+  const requiredCategory = normalizeText(params.product_category)
+  if (requiredCategory && productCategory) {
+    const match = productCategory === requiredCategory || productCategory.includes(requiredCategory) || requiredCategory.includes(productCategory)
+    reasons.push(match ? `Kategorie passt (${product.kategorie})` : `Kategorie abweichend (${product.kategorie} ≠ ${params.product_category})`)
+    scoreBreakdown.push({
+      component: 'Kategorie',
+      points: match ? 10 : -10,
+      detail: match ? 'Kategorie entspricht der LV-Position' : 'Kategorie weicht von der LV-Position ab',
+    })
+  }
+
+  if (params.nominal_diameter_dn != null && product.nennweite_dn != null) {
+    const match = params.nominal_diameter_dn === product.nennweite_dn
+    reasons.push(match ? `DN ${product.nennweite_dn} passt` : `DN abweichend (${product.nennweite_dn} ≠ ${params.nominal_diameter_dn})`)
+    scoreBreakdown.push({
+      component: 'DN',
+      points: match ? 12 : -15,
+      detail: match ? 'Nennweite stimmt überein' : 'Nennweite weicht ab',
+    })
+  }
+
+  if (params.load_class && product.belastungsklasse) {
+    const match = normalizeText(params.load_class) === normalizeText(product.belastungsklasse)
+    reasons.push(match ? `Belastungsklasse passt (${product.belastungsklasse})` : `Belastungsklasse abweichend (${product.belastungsklasse} ≠ ${params.load_class})`)
+    scoreBreakdown.push({
+      component: 'Belastung',
+      points: match ? 10 : -12,
+      detail: match ? 'Belastungsklasse stimmt überein' : 'Belastungsklasse weicht ab',
+    })
+  }
+
+  if (params.material && product.werkstoff) {
+    const requiredMaterial = normalizeText(params.material)
+    const actualMaterial = normalizeText(product.werkstoff)
+    const match = actualMaterial.includes(requiredMaterial) || requiredMaterial.includes(actualMaterial)
+    reasons.push(match ? `Werkstoff passt (${product.werkstoff})` : `Werkstoff abweichend (${product.werkstoff} ≠ ${params.material})`)
+    scoreBreakdown.push({
+      component: 'Werkstoff',
+      points: match ? 8 : -10,
+      detail: match ? 'Werkstoff entspricht der LV-Position' : 'Werkstoff weicht ab',
+    })
+  }
+
+  if (params.norm && product.norm_primaer) {
+    const match = normalizeText(product.norm_primaer).includes(normalizeText(params.norm))
+    reasons.push(match ? `Norm passt (${product.norm_primaer})` : `Norm abweichend (${product.norm_primaer} ≠ ${params.norm})`)
+    scoreBreakdown.push({
+      component: 'Norm',
+      points: match ? 8 : -10,
+      detail: match ? 'Norm stimmt überein' : 'Norm weicht ab',
+    })
+  }
+
+  if (params.stiffness_class_sn != null) {
+    const productSn = product.steifigkeitsklasse_sn != null ? parseFloat(String(product.steifigkeitsklasse_sn)) : null
+    if (productSn == null) {
+      warnings.push(`Keine SN-Angabe (SN${params.stiffness_class_sn} gefordert)`)
+      scoreBreakdown.push({
+        component: 'SN',
+        points: -8,
+        detail: 'Produkt hat keine auswertbare SN-Angabe',
+      })
+    } else {
+      const match = productSn >= params.stiffness_class_sn
+      reasons.push(match ? `SN${productSn} erfüllt SN${params.stiffness_class_sn}` : `SN${productSn} unter SN${params.stiffness_class_sn}`)
+      scoreBreakdown.push({
+        component: 'SN',
+        points: match ? 10 : -15,
+        detail: match ? 'Ringsteifigkeit erfüllt die Anforderung' : 'Ringsteifigkeit liegt unter der Anforderung',
+      })
+    }
+  }
+
+  return { reasons, warnings, scoreBreakdown }
+}
 
 export function useAnalysis() {
   const [file, setFile] = useState<File | null>(null)
@@ -26,7 +133,6 @@ export function useAnalysis() {
   const [step, setStep] = useState<AnalysisStep>('idle')
   const [errorText, setErrorText] = useState<string | null>(null)
   const [isExporting, setIsExporting] = useState(false)
-  const [skippedPositionIds, setSkippedPositionIds] = useState<Set<string>>(new Set())
   const [exportPreview, setExportPreview] = useState<ExportPreviewResponse | null>(null)
   const [showExportDialog, setShowExportDialog] = useState(false)
   const [isRefreshingSuggestions, setIsRefreshingSuggestions] = useState(false)
@@ -42,9 +148,23 @@ export function useAnalysis() {
   const [supplierOpenFlags, setSupplierOpenFlags] = useState<Record<string, boolean>>({})
   // Component selections: key = `${positionId}::${componentName}`, value = artikel_id
   const [componentSelections, setComponentSelections] = useState<Record<string, string>>({})
+  const [positionDecisions, setPositionDecisions] = useState<Record<string, 'accepted' | 'rejected' | 'inquiry_pending'>>({})
+  const [assignmentUiState, setAssignmentUiState] = useState<AssignmentUiState>(DEFAULT_ASSIGNMENT_UI_STATE)
+  const [isReadOnly, setIsReadOnly] = useState(false)
+  const [pendingInquiryPositionIds, setPendingInquiryPositionIds] = useState<string[]>([])
+  const [inquiries, setInquiries] = useState<SupplierInquiry[]>([])
+  const [projectUserInfo, setProjectUserInfo] = useState<{
+    assigned_user_name?: string | null
+    last_editor_name?: string | null
+    last_edited_at?: string | null
+    status?: string | null
+    offer_pdf_path?: string | null
+  }>({})
+
 
   const abortRef = useRef<AbortController | null>(null)
   const toastTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
+  const workstateSignatureRef = useRef<string>('')
 
   // Auto-fill customer/project from metadata
   const metadataAppliedRef = useRef(false)
@@ -58,6 +178,30 @@ export function useAnalysis() {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
     toastTimerRef.current = setTimeout(() => setToastMessage(null), 3000)
   }, [])
+
+  const handleRefreshInquiries = useCallback(async (targetProjectId?: number | null) => {
+    const effectiveProjectId = targetProjectId ?? projectId
+    if (!effectiveProjectId) {
+      setInquiries([])
+      setPendingInquiryPositionIds([])
+      return
+    }
+
+    try {
+      const loadedInquiries = await fetchInquiries(effectiveProjectId)
+      setInquiries(loadedInquiries)
+      const pendingPositionIds = new Set(
+        loadedInquiries
+          .filter((inq) => inq.status === 'offen' || inq.status === 'angefragt')
+          .map((inq) => inq.position_id)
+          .filter((id): id is string => Boolean(id)),
+      )
+      setPendingInquiryPositionIds(Array.from(pendingPositionIds))
+    } catch {
+      setInquiries([])
+      setPendingInquiryPositionIds([])
+    }
+  }, [projectId])
 
   const suggestionMap = useMemo(() => {
     const map: Record<string, ProductSuggestion[]> = {}
@@ -86,70 +230,129 @@ export function useAnalysis() {
   }, [selectedArticleIds, componentSelections])
 
   const matchedCount = useMemo(() => {
-    return positionSuggestions.filter((ps) => ps.suggestions.length > 0).length
+    return positionSuggestions.filter((ps) =>
+      ps.suggestions.length > 0 ||
+      (ps.component_suggestions?.some((cs) => cs.suggestions.length > 0) ?? false),
+    ).length
   }, [positionSuggestions])
 
-  const serviceCount = useMemo(() => skippedPositionIds.size, [skippedPositionIds])
+  const serviceCount = useMemo(() =>
+    positions.filter(p => p.position_type === 'dienstleistung').length,
+    [positions]
+  )
 
   const estimatedTotal = useMemo(() => {
     let total = 0
     for (const [posId, artIds] of Object.entries(selectedArticleIds)) {
-      if (skippedPositionIds.has(posId)) continue
+      const position = positions.find((p) => p.id === posId)
+      if (position?.position_type === 'dienstleistung') continue
       const suggestions = suggestionMap[posId]
       if (!suggestions) continue
-      const position = positions.find((p) => p.id === posId)
       for (let i = 0; i < artIds.length; i++) {
         const match = suggestions.find((s) => s.artikel_id === artIds[i])
-        // Price adjustments only apply to primary article
-        const unitPrice = i === 0
-          ? computeAdjustedUnitPrice(match?.price_net, priceAdjustments[posId])
-          : match?.price_net ?? null
+        const assignmentKey = i === 0 ? primaryAssignmentKey(posId) : additionalAssignmentKey(posId, artIds[i])
+        const unitPrice = computeAdjustedUnitPrice(
+          match?.price_net,
+          priceAdjustments[assignmentKey] ?? (i === 0 ? categoryAdjustments[match?.category ?? ''] : undefined),
+        )
         const artTotal = computeAdjustedTotal(unitPrice, position?.quantity)
         if (artTotal != null) total += artTotal
       }
     }
+    for (const [selectionKey, artikelId] of Object.entries(componentSelections)) {
+      const [positionId, componentName] = selectionKey.split('::')
+      const position = positions.find((p) => p.id === positionId)
+      if (position?.position_type === 'dienstleistung') continue
+      const entry = positionSuggestions.find((ps) => ps.position_id === positionId)
+      const component = entry?.component_suggestions?.find((cs) => cs.component_name === componentName)
+      const suggestion = component?.suggestions.find((s) => s.artikel_id === artikelId)
+      const unitPrice = computeAdjustedUnitPrice(
+        suggestion?.price_net,
+        priceAdjustments[componentAssignmentKey(positionId, componentName)],
+      )
+      const componentTotal = computeAdjustedTotal(unitPrice, position?.quantity)
+      if (componentTotal != null) total += componentTotal
+    }
     return total
-  }, [selectedArticleIds, suggestionMap, skippedPositionIds, positions, priceAdjustments])
+  }, [selectedArticleIds, suggestionMap, positions, priceAdjustments, categoryAdjustments, componentSelections, positionSuggestions])
 
   const customUnitPrices = useMemo(() => {
     const prices: Record<string, number> = {}
     for (const [posId, artIds] of Object.entries(selectedArticleIds)) {
-      if (skippedPositionIds.has(posId) || artIds.length === 0) continue
+      const position = positions.find(p => p.id === posId)
+      if (position?.position_type === 'dienstleistung' || artIds.length === 0) continue
       const suggestions = suggestionMap[posId]
+      const primaryKey = primaryAssignmentKey(posId)
       const match = suggestions?.find((s) => s.artikel_id === artIds[0])
-      const adjustedUnitPrice = computeAdjustedUnitPrice(match?.price_net, priceAdjustments[posId])
+      const adjustedUnitPrice = computeAdjustedUnitPrice(
+        match?.price_net,
+        priceAdjustments[primaryKey] ?? categoryAdjustments[match?.category ?? ''],
+      )
       if (isAdjustedPrice(match?.price_net, adjustedUnitPrice) && adjustedUnitPrice != null) {
-        prices[posId] = adjustedUnitPrice
+        prices[primaryKey] = adjustedUnitPrice
+      }
+
+      for (const artikelId of artIds.slice(1)) {
+        const assignmentKey = additionalAssignmentKey(posId, artikelId)
+        const article = suggestions?.find((s) => s.artikel_id === artikelId)
+        const articleAdjustedUnitPrice = computeAdjustedUnitPrice(article?.price_net, priceAdjustments[assignmentKey])
+        if (isAdjustedPrice(article?.price_net, articleAdjustedUnitPrice) && articleAdjustedUnitPrice != null) {
+          prices[assignmentKey] = articleAdjustedUnitPrice
+        }
       }
     }
-    return prices
-  }, [selectedArticleIds, suggestionMap, skippedPositionIds, priceAdjustments])
 
-  const handlePriceAdjustmentChange = useCallback((positionId: string, adjustment: PriceAdjustment) => {
-    setPriceAdjustments((prev) => ({ ...prev, [positionId]: adjustment }))
+    for (const [selectionKey, artikelId] of Object.entries(componentSelections)) {
+      const [positionId, componentName] = selectionKey.split('::')
+      const position = positions.find((p) => p.id === positionId)
+      if (position?.position_type === 'dienstleistung') continue
+      const entry = positionSuggestions.find((ps) => ps.position_id === positionId)
+      const component = entry?.component_suggestions?.find((cs) => cs.component_name === componentName)
+      const suggestion = component?.suggestions.find((s) => s.artikel_id === artikelId)
+      const assignmentKey = componentAssignmentKey(positionId, componentName)
+      const adjustedUnitPrice = computeAdjustedUnitPrice(suggestion?.price_net, priceAdjustments[assignmentKey])
+      if (isAdjustedPrice(suggestion?.price_net, adjustedUnitPrice) && adjustedUnitPrice != null) {
+        prices[assignmentKey] = adjustedUnitPrice
+      }
+    }
+
+    return prices
+  }, [selectedArticleIds, suggestionMap, positions, priceAdjustments, categoryAdjustments, componentSelections, positionSuggestions])
+
+  const handlePriceAdjustmentChange = useCallback((assignmentKey: string, adjustment: PriceAdjustment) => {
+    setPriceAdjustments((prev) => ({ ...prev, [assignmentKey]: adjustment }))
     // Remember adjustment per product category for auto-fill
-    const posSuggestions = positionSuggestions.find(ps => ps.position_id === positionId)
-    const primaryCategory = posSuggestions?.suggestions[0]?.category
-    if (primaryCategory) {
-      setCategoryAdjustments(prev => ({ ...prev, [primaryCategory]: adjustment }))
+    if (assignmentKey.endsWith('::primary')) {
+      const positionId = assignmentKey.replace(/::primary$/, '')
+      const posSuggestions = positionSuggestions.find(ps => ps.position_id === positionId)
+      const primaryCategory = posSuggestions?.suggestions[0]?.category
+      if (primaryCategory) {
+        setCategoryAdjustments(prev => ({ ...prev, [primaryCategory]: adjustment }))
+      }
     }
   }, [positionSuggestions])
 
-  const handleToggleAlternative = useCallback((positionId: string) => {
-    setAlternativeFlags(prev => ({ ...prev, [positionId]: !prev[positionId] }))
+  const handleToggleAlternative = useCallback((assignmentKey: string) => {
+    setAlternativeFlags(prev => ({
+      ...prev,
+      [assignmentKey]: !prev[assignmentKey],
+    }))
   }, [])
 
-  const handleToggleSupplierOpen = useCallback((positionId: string) => {
-    setSupplierOpenFlags(prev => ({ ...prev, [positionId]: !prev[positionId] }))
+  const handleToggleSupplierOpen = useCallback((assignmentKey: string) => {
+    setSupplierOpenFlags(prev => ({
+      ...prev,
+      [assignmentKey]: !prev[assignmentKey],
+    }))
   }, [])
 
   const handleComponentSelect = useCallback((positionId: string, componentName: string, artikelId: string) => {
-    const key = `${positionId}::${componentName}`
+    const key = componentSelectionKey(positionId, componentName)
     setComponentSelections(prev => ({ ...prev, [key]: artikelId }))
   }, [])
 
   /** Auto-detect if a product deviates from position requirements */
-  const autoDetectAlternative = useCallback((positionId: string, suggestion: ProductSuggestion) => {
+  const autoDetectAlternative = useCallback((assignmentKey: string, positionId: string, suggestion: ProductSuggestion) => {
     const position = positions.find(p => p.id === positionId)
     if (!position) return
 
@@ -161,7 +364,10 @@ export function useAnalysis() {
     if (reqSn != null && suggestion.sn != null && suggestion.sn < reqSn) isDeviation = true
 
     if (isDeviation) {
-      setAlternativeFlags(prev => ({ ...prev, [positionId]: true }))
+      setAlternativeFlags(prev => ({
+        ...prev,
+        [assignmentKey]: true,
+      }))
       showToast('Als Alternative zur bauseitigen Prüfung markiert')
     }
   }, [positions, showToast])
@@ -185,6 +391,9 @@ export function useAnalysis() {
     setCategoryAdjustments({})
     setSupplierOpenFlags({})
     setComponentSelections({})
+    setPositionDecisions({})
+    setAssignmentUiState(DEFAULT_ASSIGNMENT_UI_STATE)
+    workstateSignatureRef.current = ''
     metadataAppliedRef.current = false
 
     try {
@@ -204,16 +413,8 @@ export function useAnalysis() {
         metadataAppliedRef.current = true
       }
 
-      // Auto-skip positions the LLM classified as service
-      const autoSkipped = new Set(
-        parseData.positions
-          .filter((p) => p.position_type === 'dienstleistung')
-          .map((p) => p.id),
-      )
-      setSkippedPositionIds(autoSkipped)
-
       setStep('matching')
-      const suggestionData = await fetchSuggestions(parseData.positions, controller.signal)
+      const suggestionData = await fetchSuggestions(parseData.positions, controller.signal, projectId)
       setPositionSuggestions(suggestionData.suggestions)
 
       const defaults: Record<string, string[]> = {}
@@ -225,7 +426,7 @@ export function useAnalysis() {
         if (entry.component_suggestions) {
           for (const cs of entry.component_suggestions) {
             if (cs.suggestions.length > 0) {
-              compDefaults[`${entry.position_id}::${cs.component_name}`] = cs.suggestions[0].artikel_id
+              compDefaults[componentSelectionKey(entry.position_id, cs.component_name)] = cs.suggestions[0].artikel_id
             }
           }
         }
@@ -252,13 +453,13 @@ export function useAnalysis() {
     abortRef.current?.abort()
   }, [])
 
-  /** Swap only the primary (first) article, keeping additional articles intact */
-  const handleSwapPrimary = useCallback((positionId: string, artikelId: string) => {
+  // Silent select — used by carousel swiping / auto-select. No undo, no override recording.
+  const handleSilentSelect = useCallback((positionId: string, artikelId: string) => {
     setSelectedArticleIds((current) => {
       const prev = current[positionId] ?? []
-      const additional = prev.slice(1) // keep additional articles
-      if (prev[0] === artikelId) return current // no change needed
-      return { ...current, [positionId]: [artikelId, ...additional] }
+      if (prev[0] === artikelId) return current
+      const additionalArticles = prev.slice(1).filter(id => id !== artikelId)
+      return { ...current, [positionId]: [artikelId, ...additionalArticles] }
     })
   }, [])
 
@@ -266,7 +467,9 @@ export function useAnalysis() {
     setSelectedArticleIds((current) => {
       const prev = current[positionId]
       pushUndo({ type: 'select', positionId, previousArticleIds: prev })
-      const next = { ...current, [positionId]: [artikelId] }
+      // Replace primary article (index 0) but keep additional articles (index 1+)
+      const additionalArticles = (prev ?? []).slice(1).filter(id => id !== artikelId)
+      const next = { ...current, [positionId]: [artikelId, ...additionalArticles] }
 
       // Record override if user chose a non-top suggestion
       const posSuggestions = positionSuggestions.find(ps => ps.position_id === positionId)
@@ -285,20 +488,16 @@ export function useAnalysis() {
         }
       }
 
-      // Auto-detect alternative
-      const selected = positionSuggestions.find(ps => ps.position_id === positionId)
-        ?.suggestions.find(s => s.artikel_id === artikelId)
-      if (selected) autoDetectAlternative(positionId, selected)
-
       return next
     })
-  }, [positions, positionSuggestions, pushUndo, autoDetectAlternative])
+  }, [positions, positionSuggestions, pushUndo])
 
   const handleManualSelect = useCallback((positionId: string, product: ProductSearchResult) => {
     const position = positions.find(p => p.id === positionId)
     const qty = position?.quantity ?? 1
     const unitPrice = product.vk_listenpreis_netto ?? null
     const totalNet = unitPrice != null ? Math.round(unitPrice * qty * 100) / 100 : null
+    const manualComparison = buildManualComparison(position, product, 'manual')
 
     const syntheticSuggestion: ProductSuggestion = {
       artikel_id: product.artikel_id,
@@ -316,16 +515,21 @@ export function useAnalysis() {
       total_net: totalNet,
       currency: product.waehrung ?? 'EUR',
       score: 0,
-      reasons: ['Manuell gewählt'],
-      warnings: [],
-      score_breakdown: [],
+      reasons: manualComparison.reasons,
+      warnings: manualComparison.warnings,
+      score_breakdown: manualComparison.scoreBreakdown,
       is_manual: true,
     }
 
     setPositionSuggestions(prev => {
       const hasEntry = prev.some(ps => ps.position_id === positionId)
       if (!hasEntry) {
-        return [...prev, { position_id: positionId, suggestions: [syntheticSuggestion] }]
+        return [...prev, {
+          position_id: positionId,
+          ordnungszahl: position?.ordnungszahl ?? '',
+          description: position?.description ?? '',
+          suggestions: [syntheticSuggestion],
+        }]
       }
       return prev.map(ps => {
         if (ps.position_id !== positionId) return ps
@@ -354,7 +558,7 @@ export function useAnalysis() {
     }
 
     // Auto-detect alternative
-    autoDetectAlternative(positionId, syntheticSuggestion)
+    autoDetectAlternative(primaryAssignmentKey(positionId), positionId, syntheticSuggestion)
   }, [positions, pushUndo, autoDetectAlternative])
 
   const handleAddArticle = useCallback((positionId: string, product: ProductSearchResult) => {
@@ -362,6 +566,7 @@ export function useAnalysis() {
     const qty = position?.quantity ?? 1
     const unitPrice = product.vk_listenpreis_netto ?? null
     const totalNet = unitPrice != null ? Math.round(unitPrice * qty * 100) / 100 : null
+    const manualComparison = buildManualComparison(position, product, 'additional')
 
     const syntheticSuggestion: ProductSuggestion = {
       artikel_id: product.artikel_id,
@@ -379,9 +584,9 @@ export function useAnalysis() {
       total_net: totalNet,
       currency: product.waehrung ?? 'EUR',
       score: 0,
-      reasons: ['Zusatzartikel'],
-      warnings: [],
-      score_breakdown: [],
+      reasons: manualComparison.reasons,
+      warnings: manualComparison.warnings,
+      score_breakdown: manualComparison.scoreBreakdown,
       is_manual: true,
     }
 
@@ -389,7 +594,12 @@ export function useAnalysis() {
       const hasEntry = prev.some(ps => ps.position_id === positionId)
       if (!hasEntry) {
         // Position has no suggestions entry yet — create one
-        return [...prev, { position_id: positionId, suggestions: [syntheticSuggestion] }]
+        return [...prev, {
+          position_id: positionId,
+          ordnungszahl: position?.ordnungszahl ?? '',
+          description: position?.description ?? '',
+          suggestions: [syntheticSuggestion],
+        }]
       }
       return prev.map(ps => {
         if (ps.position_id !== positionId) return ps
@@ -420,21 +630,6 @@ export function useAnalysis() {
     })
   }, [positions, pushUndo])
 
-  const handleToggleSkip = useCallback((positionId: string) => {
-    setSkippedPositionIds((prev) => {
-      const next = new Set(prev)
-      if (next.has(positionId)) {
-        next.delete(positionId)
-        pushUndo({ type: 'unskip', positionId })
-      } else {
-        next.add(positionId)
-        pushUndo({ type: 'skip', positionId })
-        showToast('Position ausgeschlossen')
-      }
-      return next
-    })
-  }, [pushUndo, showToast])
-
   const handleUndo = useCallback(() => {
     setUndoStack(prev => {
       if (prev.length === 0) return prev
@@ -456,20 +651,6 @@ export function useAnalysis() {
         case 'deselect':
           setSelectedArticleIds(current => {
             const next = { ...current, [action.positionId]: action.previousArticleIds }
-            return next
-          })
-          break
-        case 'skip':
-          setSkippedPositionIds(current => {
-            const next = new Set(current)
-            next.delete(action.positionId)
-            return next
-          })
-          break
-        case 'unskip':
-          setSkippedPositionIds(current => {
-            const next = new Set(current)
-            next.add(action.positionId)
             return next
           })
           break
@@ -529,25 +710,115 @@ export function useAnalysis() {
     }
   }, [positions])
 
+  const handleComponentManualSelect = useCallback((positionId: string, componentName: string, product: ProductSearchResult) => {
+    const position = positions.find((p) => p.id === positionId)
+    const qty = position?.quantity ?? 1
+    const unitPrice = product.vk_listenpreis_netto ?? null
+    const totalNet = unitPrice != null ? Math.round(unitPrice * qty * 100) / 100 : null
+    const manualComparison = buildManualComparison(position, product, 'manual')
+
+    const syntheticSuggestion: ProductSuggestion = {
+      artikel_id: product.artikel_id,
+      artikelname: product.artikelname,
+      hersteller: product.hersteller ?? null,
+      category: product.kategorie ?? null,
+      subcategory: null,
+      dn: product.nennweite_dn ?? null,
+      sn: product.steifigkeitsklasse_sn != null ? parseFloat(String(product.steifigkeitsklasse_sn)) || null : null,
+      load_class: product.belastungsklasse ?? null,
+      norm: product.norm_primaer ?? null,
+      stock: product.lager_gesamt ?? null,
+      delivery_days: null,
+      price_net: unitPrice,
+      total_net: totalNet,
+      currency: product.waehrung ?? 'EUR',
+      score: 0,
+      reasons: manualComparison.reasons,
+      warnings: manualComparison.warnings,
+      score_breakdown: manualComparison.scoreBreakdown,
+      is_manual: true,
+    }
+
+    setPositionSuggestions(prev => prev.map((ps) => {
+      if (ps.position_id !== positionId || !ps.component_suggestions) return ps
+      return {
+        ...ps,
+        component_suggestions: ps.component_suggestions.map((cs) => {
+          if (cs.component_name !== componentName) return cs
+          const filtered = cs.suggestions.filter((s) => !s.is_manual || s.artikel_id !== product.artikel_id)
+          return { ...cs, suggestions: [syntheticSuggestion, ...filtered] }
+        }),
+      }
+    }))
+
+    setComponentSelections(prev => ({
+      ...prev,
+      [componentSelectionKey(positionId, componentName)]: product.artikel_id,
+    }))
+  }, [positions])
+
+  const handleSetPositionDecision = useCallback((positionId: string, decision?: 'accepted' | 'rejected' | 'inquiry_pending') => {
+    if ((decision === 'accepted' || decision === 'rejected') && projectId) {
+      cleanupOpenInquiriesForPosition(projectId, positionId)
+        .then(() => handleRefreshInquiries(projectId))
+        .catch(() => {})
+    } else if (decision === 'inquiry_pending' && projectId) {
+      handleRefreshInquiries(projectId)
+        .catch(() => {})
+    }
+
+    setPositionDecisions((current) => {
+      if (decision) {
+        if (current[positionId] === decision) return current
+        return { ...current, [positionId]: decision }
+      }
+      if (!(positionId in current)) return current
+      const next = { ...current }
+      delete next[positionId]
+      return next
+    })
+  }, [projectId, handleRefreshInquiries])
+
+  const handleAssignmentUiStateChange = useCallback((nextState: AssignmentUiState) => {
+    setAssignmentUiState((current) => {
+      const normalized: AssignmentUiState = {
+        active_filter: nextState.active_filter ?? 'alle',
+        current_position_id: nextState.current_position_id ?? null,
+        is_finished: Boolean(nextState.is_finished),
+      }
+      if (
+        current.active_filter === normalized.active_filter
+        && current.current_position_id === normalized.current_position_id
+        && Boolean(current.is_finished) === normalized.is_finished
+      ) {
+        return current
+      }
+      return normalized
+    })
+  }, [])
+
   /** Build active selections including component selections for multi-component positions */
   const buildActiveSelections = useCallback(() => {
+    const dlPositionIds = new Set(positions.filter(p => p.position_type === 'dienstleistung').map(p => p.id))
     const activeSelections: Record<string, string[]> = {}
+    const assignmentKeysByPosition: Record<string, string[]> = {}
     for (const [posId, artIds] of Object.entries(selectedArticleIds)) {
-      if (!skippedPositionIds.has(posId) && artIds.length > 0) {
-        activeSelections[posId] = artIds
+      if (!dlPositionIds.has(posId) && artIds.length > 0) {
+        activeSelections[posId] = [...artIds]
+        assignmentKeysByPosition[posId] = [primaryAssignmentKey(posId), ...artIds.slice(1).map((artikelId) => additionalAssignmentKey(posId, artikelId))]
       }
     }
-    // Merge component selections: each component article becomes an additional entry
+    // Merge component selections: each component article remains its own assignment entry.
     for (const [key, artikelId] of Object.entries(componentSelections)) {
-      const [posId] = key.split('::')
-      if (skippedPositionIds.has(posId)) continue
+      const [posId, componentName] = key.split('::')
+      if (dlPositionIds.has(posId)) continue
       if (!activeSelections[posId]) activeSelections[posId] = []
-      if (!activeSelections[posId].includes(artikelId)) {
-        activeSelections[posId].push(artikelId)
-      }
+      if (!assignmentKeysByPosition[posId]) assignmentKeysByPosition[posId] = []
+      activeSelections[posId].push(artikelId)
+      assignmentKeysByPosition[posId].push(componentAssignmentKey(posId, componentName))
     }
-    return activeSelections
-  }, [selectedArticleIds, skippedPositionIds, componentSelections])
+    return { selectedArticleIds: activeSelections, assignmentKeysByPosition }
+  }, [selectedArticleIds, positions, componentSelections])
 
   const handleExportPreview = useCallback(async () => {
     if (positions.length === 0 || selectedCount === 0) {
@@ -561,7 +832,16 @@ export function useAnalysis() {
     const activeSelections = buildActiveSelections()
 
     try {
-      const preview = await fetchExportPreview(positions, activeSelections, customerName, projectName, customUnitPrices, alternativeFlags, supplierOpenFlags)
+      const preview = await fetchExportPreview(
+        positions,
+        activeSelections.selectedArticleIds,
+        customerName,
+        projectName,
+        customUnitPrices,
+        alternativeFlags,
+        supplierOpenFlags,
+        activeSelections.assignmentKeysByPosition,
+      )
       setExportPreview(preview)
       setShowExportDialog(true)
     } catch (error) {
@@ -581,7 +861,17 @@ export function useAnalysis() {
     const activeSelections = buildActiveSelections()
 
     try {
-      const blob = await exportOffer(positions, activeSelections, customerName, projectName, customUnitPrices, alternativeFlags, supplierOpenFlags)
+      const blob = await exportOffer(
+        positions,
+        activeSelections.selectedArticleIds,
+        customerName,
+        projectName,
+        customUnitPrices,
+        alternativeFlags,
+        supplierOpenFlags,
+        activeSelections.assignmentKeysByPosition,
+        projectId,
+      )
       const url = window.URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
@@ -591,7 +881,7 @@ export function useAnalysis() {
 
       // Feature 5: Save selections for future duplicate reuse
       if (projectId) {
-        saveSelections(projectId, activeSelections).catch(() => {})
+        saveSelections(projectId, activeSelections.selectedArticleIds).catch(() => {})
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unbekannter Fehler'
@@ -606,14 +896,15 @@ export function useAnalysis() {
   }, [])
 
   const handleAcceptAllTop = useCallback(() => {
+    const dlIds = new Set(positions.filter(p => p.position_type === 'dienstleistung').map(p => p.id))
     const defaults: Record<string, string[]> = {}
     positionSuggestions.forEach((entry) => {
-      if (entry.suggestions.length > 0 && !skippedPositionIds.has(entry.position_id)) {
+      if (entry.suggestions.length > 0 && !dlIds.has(entry.position_id)) {
         defaults[entry.position_id] = [entry.suggestions[0].artikel_id]
       }
     })
     setSelectedArticleIds(defaults)
-  }, [positionSuggestions, skippedPositionIds])
+  }, [positionSuggestions, positions])
 
   const handleLoadProject = useCallback(async (loadProjectId: number) => {
     abortRef.current?.abort()
@@ -629,11 +920,23 @@ export function useAnalysis() {
     setCategoryAdjustments({})
     setSupplierOpenFlags({})
     setComponentSelections({})
+    setPositionDecisions({})
+    setAssignmentUiState(DEFAULT_ASSIGNMENT_UI_STATE)
+    setIsReadOnly(false)
+    setPendingInquiryPositionIds([])
     setStep('matching')
     metadataAppliedRef.current = false
 
     try {
-      const { project, positions: loadedPositions, metadata: loadedMetadata, selections } = await fetchProject(loadProjectId)
+      const {
+        project,
+        positions: loadedPositions,
+        metadata: loadedMetadata,
+        selections,
+        decisions,
+        component_selections: storedComponentSelections,
+        ui_state: storedUiState,
+      } = await fetchProject(loadProjectId)
       setPositions(loadedPositions)
       setActivePositionId(loadedPositions[0]?.id ?? null)
       setProjectName(project.project_name ?? '')
@@ -645,14 +948,47 @@ export function useAnalysis() {
         if (loadedMetadata.bauvorhaben && !project.project_name) setProjectName(loadedMetadata.bauvorhaben)
       }
 
-      const autoSkipped = new Set(
-        loadedPositions
-          .filter((p) => p.position_type === 'dienstleistung')
-          .map((p) => p.id),
-      )
-      setSkippedPositionIds(autoSkipped)
+      setProjectUserInfo({
+        assigned_user_name: project.assigned_user_name,
+        last_editor_name: project.last_editor_name,
+        last_edited_at: project.last_edited_at,
+        status: project.status,
+        offer_pdf_path: project.offer_pdf_path,
+      })
 
-      const suggestionData = await fetchSuggestions(loadedPositions, controller.signal)
+      if (loadProjectId) {
+        handleRefreshInquiries(loadProjectId)
+      }
+
+      // Read-only mode only for completed projects.
+      if (project.status === 'gerechnet') {
+        setIsReadOnly(true)
+        const restoredSelections = selections && Object.keys(selections).length > 0 ? selections : {}
+        const restoredComponentSelections = storedComponentSelections ?? {}
+        const restoredDecisions = decisions ?? {}
+        setSelectedArticleIds(restoredSelections)
+        setComponentSelections(restoredComponentSelections)
+        setPositionDecisions(restoredDecisions)
+        setAssignmentUiState({
+          active_filter: storedUiState?.active_filter ?? 'alle',
+          current_position_id: storedUiState?.current_position_id ?? null,
+          is_finished: Boolean(storedUiState?.is_finished),
+        })
+        workstateSignatureRef.current = JSON.stringify({
+          selected_article_ids: restoredSelections,
+          decisions: restoredDecisions,
+          component_selections: restoredComponentSelections,
+          ui_state: {
+            active_filter: storedUiState?.active_filter ?? 'alle',
+            current_position_id: storedUiState?.current_position_id ?? null,
+            is_finished: Boolean(storedUiState?.is_finished),
+          },
+        })
+        setStep('done')
+        return
+      }
+
+      const suggestionData = await fetchSuggestions(loadedPositions, controller.signal, loadProjectId)
       setPositionSuggestions(suggestionData.suggestions)
 
       // Auto-default component selections
@@ -661,25 +997,74 @@ export function useAnalysis() {
         if (entry.component_suggestions) {
           for (const cs of entry.component_suggestions) {
             if (cs.suggestions.length > 0) {
-              compDefaults[`${entry.position_id}::${cs.component_name}`] = cs.suggestions[0].artikel_id
+              compDefaults[componentSelectionKey(entry.position_id, cs.component_name)] = cs.suggestions[0].artikel_id
             }
           }
         }
       })
-      setComponentSelections(compDefaults)
+      const hasStoredSelections = Boolean(selections && Object.keys(selections).length > 0)
+      const hasStoredComponentSelections = Boolean(storedComponentSelections && Object.keys(storedComponentSelections).length > 0)
 
-      // Use stored selections if available, otherwise default to top suggestions
-      if (selections && Object.keys(selections).length > 0) {
-        setSelectedArticleIds(selections)
-      } else {
-        const defaults: Record<string, string[]> = {}
-        suggestionData.suggestions.forEach((entry) => {
-          if (entry.suggestions.length > 0) {
-            defaults[entry.position_id] = [entry.suggestions[0].artikel_id]
-          }
-        })
-        setSelectedArticleIds(defaults)
+      // Build default selections from suggestions (first suggestion per position)
+      const freshDefaults: Record<string, string[]> = {}
+      suggestionData.suggestions.forEach((entry) => {
+        if (entry.suggestions.length > 0) {
+          freshDefaults[entry.position_id] = [entry.suggestions[0].artikel_id]
+        }
+      })
+
+      const restoredSelections = hasStoredSelections
+        ? (() => {
+          const merged = { ...(selections as Record<string, string[]>) }
+          // Inject new supplier offer suggestions that weren't in the stored selections.
+          // When a supplier offer comes in after the user already saved selections,
+          // the offer article (SO-*) replaces the stored catalog selection so the
+          // user sees the actual offer with the correct price.
+          suggestionData.suggestions.forEach((entry) => {
+            const offerSugg = entry.suggestions.find((s) => s.is_supplier_offer)
+            if (!offerSugg) return
+            const current = merged[entry.position_id]
+            if (!current || !current.includes(offerSugg.artikel_id)) {
+              // Prepend the offer article, keep existing selections as additional
+              merged[entry.position_id] = [offerSugg.artikel_id, ...(current ?? []).filter((id) => id !== offerSugg.artikel_id)]
+            }
+          })
+          return merged
+        })()
+        : freshDefaults
+      const restoredComponentSelections = hasStoredComponentSelections
+        ? (storedComponentSelections as Record<string, string>)
+        : compDefaults
+
+      const restoredDecisions = decisions && Object.keys(decisions).length > 0
+        ? decisions
+        : ((hasStoredSelections || hasStoredComponentSelections) ? (() => {
+          const compatibleFallback: Record<string, 'accepted' | 'rejected' | 'inquiry_pending'> = {}
+          Object.entries(restoredSelections).forEach(([positionId, ids]) => {
+            if (ids.length > 0) compatibleFallback[positionId] = 'accepted'
+          })
+          Object.keys(restoredComponentSelections).forEach((selectionKey) => {
+            const [positionId] = selectionKey.split('::')
+            if (!compatibleFallback[positionId]) compatibleFallback[positionId] = 'accepted'
+          })
+          return compatibleFallback
+        })() : {})
+
+      setSelectedArticleIds(restoredSelections)
+      setComponentSelections(restoredComponentSelections)
+      setPositionDecisions(restoredDecisions)
+      const normalizedUiState: AssignmentUiState = {
+        active_filter: storedUiState?.active_filter ?? 'alle',
+        current_position_id: storedUiState?.current_position_id ?? null,
+        is_finished: Boolean(storedUiState?.is_finished),
       }
+      setAssignmentUiState(normalizedUiState)
+      workstateSignatureRef.current = JSON.stringify({
+        selected_article_ids: restoredSelections,
+        decisions: restoredDecisions,
+        component_selections: restoredComponentSelections,
+        ui_state: normalizedUiState,
+      })
       setStep('done')
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -693,7 +1078,7 @@ export function useAnalysis() {
     } finally {
       clearTimeout(timeoutId)
     }
-  }, [])
+  }, [handleRefreshInquiries])
 
   const handleRejectSuggestion = useCallback((positionId: string) => {
     setSelectedArticleIds((current) => {
@@ -714,7 +1099,6 @@ export function useAnalysis() {
     setPositionSuggestions([])
     setSelectedArticleIds({})
     setActivePositionId(null)
-    setSkippedPositionIds(new Set())
     setExportPreview(null)
     setShowExportDialog(false)
     setDuplicateInfo(null)
@@ -726,10 +1110,66 @@ export function useAnalysis() {
     setCategoryAdjustments({})
     setSupplierOpenFlags({})
     setComponentSelections({})
+    setPositionDecisions({})
+    setAssignmentUiState(DEFAULT_ASSIGNMENT_UI_STATE)
+    setPendingInquiryPositionIds([])
+    setInquiries([])
     setAlternativeFlags({})
+    setIsReadOnly(false)
+    setProjectUserInfo({})
+    workstateSignatureRef.current = ''
     setStep('idle')
     setErrorText(null)
   }, [])
+
+  useEffect(() => {
+    if (!projectId || isReadOnly || step !== 'done') return
+
+    const materialPositionIds = new Set(
+      positions.filter((position) => position.position_type !== 'dienstleistung').map((position) => position.id),
+    )
+
+    const normalizedSelections: Record<string, string[]> = {}
+    Object.entries(selectedArticleIds).forEach(([positionId, articleIds]) => {
+      if (!materialPositionIds.has(positionId)) return
+      if (articleIds.length === 0) return
+      normalizedSelections[positionId] = articleIds
+    })
+
+    const normalizedComponentSelections: Record<string, string> = {}
+    Object.entries(componentSelections).forEach(([selectionKey, artikelId]) => {
+      const [positionId] = selectionKey.split('::')
+      if (!materialPositionIds.has(positionId)) return
+      if (!artikelId) return
+      normalizedComponentSelections[selectionKey] = artikelId
+    })
+
+    const normalizedDecisions: Record<string, 'accepted' | 'rejected' | 'inquiry_pending'> = {}
+    Object.entries(positionDecisions).forEach(([positionId, decision]) => {
+      if (!materialPositionIds.has(positionId)) return
+      normalizedDecisions[positionId] = decision
+    })
+
+    const payload = {
+      project_id: projectId,
+      selected_article_ids: normalizedSelections,
+      decisions: normalizedDecisions,
+      component_selections: normalizedComponentSelections,
+      ui_state: assignmentUiState,
+    }
+    const signature = JSON.stringify(payload)
+    if (signature === workstateSignatureRef.current) return
+
+    const timer = setTimeout(() => {
+      saveWorkstate(payload)
+        .then(() => {
+          workstateSignatureRef.current = signature
+        })
+        .catch(() => {})
+    }, 700)
+
+    return () => clearTimeout(timer)
+  }, [projectId, isReadOnly, step, positions, selectedArticleIds, componentSelections, positionDecisions, assignmentUiState])
 
   return {
     file, setFile,
@@ -749,7 +1189,6 @@ export function useAnalysis() {
     serviceCount,
     estimatedTotal,
     suggestionMap,
-    skippedPositionIds,
     isRefreshingSuggestions,
     duplicateInfo,
     showExportDialog,
@@ -765,9 +1204,8 @@ export function useAnalysis() {
     handleAnalyze,
     handleCancel,
     handleSuggestionSelect,
-    handleSwapPrimary,
+    handleSilentSelect,
     handleManualSelect,
-    handleToggleSkip,
     handleParameterChange,
     handleExportPreview,
     handleExportConfirm,
@@ -786,5 +1224,15 @@ export function useAnalysis() {
     handleToggleSupplierOpen,
     componentSelections,
     handleComponentSelect,
+    handleComponentManualSelect,
+    positionDecisions,
+    handleSetPositionDecision,
+    assignmentUiState,
+    handleAssignmentUiStateChange,
+    pendingInquiryPositionIds,
+    inquiries,
+    handleRefreshInquiries,
+    isReadOnly,
+    projectUserInfo,
   }
 }

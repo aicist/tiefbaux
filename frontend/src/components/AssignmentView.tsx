@@ -1,26 +1,19 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { fetchInquiries, getProjectPdfUrl, sendBatchInquiries } from '../api'
-import type { LVPosition, PositionSuggestions, PriceAdjustment, ProductSearchResult, ProductSuggestion, SupplierInquiry } from '../types'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { fetchInquiries, getProjectPdfUrl } from '../api'
+import { InquiryReviewScreen } from './InquiryReviewScreen'
+import type { AssignmentUiState, LVPosition, PositionSuggestions, PriceAdjustment, ProductSearchResult, ProductSuggestion, SupplierInquiry } from '../types'
 import { DinBadge } from './DinBadge'
 import { InquiryModal } from './InquiryModal'
 import { PriceAdjustmentControl } from './PriceAdjustmentControl'
 import { ProductSearchModal } from './ProductSearchModal'
 import { computeAdjustedTotal, computeAdjustedUnitPrice, isAdjustedPrice } from '../utils/pricing'
-
-const PARAM_STYLES: Record<string, React.CSSProperties> = {
-  match: { background: '#dcfce7', color: '#166534' },
-  mismatch: { background: '#fee2e2', color: '#991b1b' },
-  neutral: { background: '#f1f5f9', color: '#334155' },
-}
+import { additionalAssignmentKey, componentAssignmentKey, componentSelectionKey, primaryAssignmentKey } from '../utils/assignmentKeys'
 
 const LOAD_CLASS_CATEGORIES = new Set(['Schachtabdeckungen', 'Straßenentwässerung'])
 
 function ParamBadge({ label, status }: { label: string; status: 'match' | 'mismatch' | 'neutral' }) {
   return (
-    <span
-      className={`param-badge param-${status}`}
-      style={{ ...PARAM_STYLES[status], padding: '2px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 600 }}
-    >
+    <span className={`param-badge param-${status}`}>
       {label}
     </span>
   )
@@ -29,6 +22,30 @@ function ParamBadge({ label, status }: { label: string; status: 'match' | 'misma
 function extractSnFromText(text: string): number | null {
   const match = text.match(/SN\s*(\d+)/i)
   return match ? parseInt(match[1], 10) : null
+}
+
+function shouldShowNormBadge(_position: LVPosition, suggestion: ProductSuggestion): boolean {
+  if (!suggestion.norm) return false
+  return true
+}
+
+function filterSuggestionWarnings(warnings: string[]): string[] {
+  return warnings.filter((warning) => {
+    const lower = warning.toLowerCase()
+    return lower.includes('menge nicht erkannt')
+      || lower.includes('listenpreis ist 0')
+      || lower.includes('kein preis verfügbar')
+  })
+}
+
+function filterSuggestionReasons(reasons: string[]): string[] {
+  return reasons.filter((reason) => {
+    const lower = reason.toLowerCase()
+    if (lower.includes('norm abweichend')) return false
+    if (lower.includes('lager')) return false
+    if (/^(dn|od|anschluss-dn)\b/i.test(reason)) return false
+    return true
+  })
 }
 
 function formatMoney(value?: number | null, currency = 'EUR'): string {
@@ -41,9 +58,9 @@ function formatMoney(value?: number | null, currency = 'EUR'): string {
 }
 
 function scoreColor(score: number): string {
-  if (score >= 50) return '#16a34a'
-  if (score >= 30) return '#ca8a04'
-  return '#dc2626'
+  if (score >= 50) return 'var(--accent)'
+  if (score >= 30) return 'var(--warn)'
+  return 'var(--danger)'
 }
 
 function stockStatus(stock?: number | null): { label: string; className: string } {
@@ -52,7 +69,81 @@ function stockStatus(stock?: number | null): { label: string; className: string 
   return { label: `${stock} auf Lager`, className: 'stock-green' }
 }
 
-export type AssignmentDecision = 'accepted' | 'rejected' | 'skipped'
+function tokenizeOfferText(text: string): Set<string> {
+  const parts = (text.toLowerCase().match(/[a-z0-9äöüß]{3,}/g) ?? [])
+  return new Set(parts)
+}
+
+function offerMatchScore(suggestion: ProductSuggestion, inquiry: SupplierInquiry): number {
+  const offerText = inquiry.product_description ?? ''
+  const offerTokens = tokenizeOfferText(offerText)
+  if (offerTokens.size === 0) return 0
+
+  const suggestionText = [
+    suggestion.artikel_id,
+    suggestion.artikelname,
+    suggestion.hersteller ?? '',
+    suggestion.category ?? '',
+    suggestion.subcategory ?? '',
+  ].join(' ')
+  const suggestionTokens = tokenizeOfferText(suggestionText)
+  if (suggestionTokens.size === 0) return 0
+
+  let score = 0
+  for (const token of suggestionTokens) {
+    if (offerTokens.has(token)) score += 2
+  }
+
+  const normalizedOffer = offerText.toLowerCase()
+  if (suggestion.artikel_id && normalizedOffer.includes(suggestion.artikel_id.toLowerCase())) score += 8
+  if (suggestion.dn != null && new RegExp(`\\bdn\\s*${suggestion.dn}\\b`, 'i').test(offerText)) score += 4
+  if (suggestion.hersteller && inquiry.supplier_name) {
+    const supplierToken = inquiry.supplier_name.toLowerCase().split(/\s+/)[0]
+    if (supplierToken && suggestion.hersteller.toLowerCase().includes(supplierToken)) score += 3
+  }
+  return score
+}
+
+function mapOfferSuggestionSources(
+  suggestions: ProductSuggestion[],
+  receivedInquiries: SupplierInquiry[],
+): Record<string, string> {
+  // If real supplier offer suggestions (SO-*) are already present, skip fuzzy
+  // matching to avoid showing misleading "Aus Lieferantenangebot" badges on
+  // catalog articles with different prices.
+  const hasRealOfferSuggestions = suggestions.some((s) => s.is_supplier_offer)
+  if (hasRealOfferSuggestions) return {}
+
+  const byArtikelId: Record<string, string> = {}
+  for (const inquiry of receivedInquiries) {
+    let best: ProductSuggestion | null = null
+    let bestScore = 0
+    for (const suggestion of suggestions) {
+      const score = offerMatchScore(suggestion, inquiry)
+      if (score > bestScore) {
+        best = suggestion
+        bestScore = score
+      }
+    }
+    if (best && bestScore >= 2 && !byArtikelId[best.artikel_id]) {
+      byArtikelId[best.artikel_id] = inquiry.supplier_name
+    }
+  }
+  return byArtikelId
+}
+
+function prioritizeOfferSuggestions(
+  suggestions: ProductSuggestion[],
+  offerSourcesByArtikelId: Record<string, string>,
+): ProductSuggestion[] {
+  const offerIds = new Set(Object.keys(offerSourcesByArtikelId))
+  if (offerIds.size === 0) return suggestions
+  const matched = suggestions.filter((s) => offerIds.has(s.artikel_id))
+  const rest = suggestions.filter((s) => !offerIds.has(s.artikel_id))
+  return [...matched, ...rest]
+}
+
+export type AssignmentDecision = 'accepted' | 'rejected' | 'inquiry_pending'
 
 type FilterTab = 'alle' | 'zugeordnet' | 'offen' | 'dienstleistung'
 
@@ -60,38 +151,44 @@ type Props = {
   positions: LVPosition[]
   suggestionMap: Record<string, ProductSuggestion[]>
   selectedArticleIds: Record<string, string[]>
-  skippedPositionIds: Set<string>
+  decisions?: Record<string, AssignmentDecision>
+  onDecisionChange?: (positionId: string, decision?: AssignmentDecision) => void
   priceAdjustments: Record<string, PriceAdjustment>
   categoryAdjustments: Record<string, PriceAdjustment>
   onAccept: (positionId: string, artikelId: string) => void
-  onSwapPrimary: (positionId: string, artikelId: string) => void
+  onSilentSelect?: (positionId: string, artikelId: string) => void
   onReject: (positionId: string) => void
   onManualSelect: (positionId: string, product: ProductSearchResult) => void
   onAddArticle: (positionId: string, product: ProductSearchResult) => void
   onRemoveArticle: (positionId: string, artikelId: string) => void
-  onPriceAdjustmentChange: (positionId: string, adjustment: PriceAdjustment) => void
+  onPriceAdjustmentChange: (assignmentKey: string, adjustment: PriceAdjustment) => void
   onFinish: () => void
   onBackToOverview: () => void
   projectId?: number | null
   projectName?: string | null
   alternativeFlags?: Record<string, boolean>
-  onToggleAlternative?: (positionId: string) => void
+  onToggleAlternative?: (assignmentKey: string) => void
   supplierOpenFlags?: Record<string, boolean>
-  onToggleSupplierOpen?: (positionId: string) => void
+  onToggleSupplierOpen?: (assignmentKey: string) => void
   positionSuggestions?: PositionSuggestions[]
   componentSelections?: Record<string, string>
   onComponentSelect?: (positionId: string, componentName: string, artikelId: string) => void
+  onComponentManualSelect?: (positionId: string, componentName: string, product: ProductSearchResult) => void
+  persistedUiState?: AssignmentUiState | null
+  onUiStateChange?: (state: AssignmentUiState) => void
+  onRefreshInquiries?: (projectId?: number | null) => Promise<void> | void
 }
 
 export function AssignmentView({
   positions,
   suggestionMap,
   selectedArticleIds,
-  skippedPositionIds,
+  decisions: externalDecisions,
+  onDecisionChange,
   priceAdjustments,
   categoryAdjustments,
   onAccept,
-  onSwapPrimary,
+  onSilentSelect,
   onReject,
   onManualSelect,
   onAddArticle,
@@ -108,69 +205,121 @@ export function AssignmentView({
   positionSuggestions = [],
   componentSelections = {},
   onComponentSelect,
+  onComponentManualSelect,
+  persistedUiState,
+  onUiStateChange,
+  onRefreshInquiries,
 }: Props) {
   const [currentIndex, setCurrentIndex] = useState(0)
-  const [decisions, setDecisions] = useState<Record<string, AssignmentDecision>>({})
+  const [decisions, setDecisions] = useState<Record<string, AssignmentDecision>>(externalDecisions ?? {})
   const [searchOpen, setSearchOpen] = useState(false)
   const [inquiryOpen, setInquiryOpen] = useState(false)
   const [inquiryProductName, setInquiryProductName] = useState<string | null>(null)
   const [slideDirection, setSlideDirection] = useState<'left' | 'right' | null>(null)
-  const [activeFilter, setActiveFilter] = useState<FilterTab>('alle')
+  const [activeFilter, setActiveFilter] = useState<FilterTab>(persistedUiState?.active_filter ?? 'alle')
   const [pendingInquiries, setPendingInquiries] = useState<SupplierInquiry[]>([])
+  const [projectInquiries, setProjectInquiries] = useState<SupplierInquiry[]>([])
   const [inquiriesLoading, setInquiriesLoading] = useState(false)
-  const [sendingInquiries, setSendingInquiries] = useState(false)
   const [inquiriesSentResult, setInquiriesSentResult] = useState<{ sent: number; failed: number } | null>(null)
+  const [showInquiryReview, setShowInquiryReview] = useState(false)
+  const [decisionHistory, setDecisionHistory] = useState<Array<{
+    positionId: string
+    previousDecision: AssignmentDecision | undefined
+    previousArticleIds: string[] | undefined
+    previousIndex: number
+  }>>([])
+
+  useEffect(() => {
+    setDecisions(externalDecisions ?? {})
+  }, [externalDecisions])
+
+  useEffect(() => {
+    progressHydratedRef.current = false
+  }, [projectId])
 
   // Categorize positions
   const materialPositions = useMemo(
-    () => positions.filter(p => !skippedPositionIds.has(p.id)),
-    [positions, skippedPositionIds],
+    () => positions.filter(p => p.position_type !== 'dienstleistung'),
+    [positions],
   )
 
   const servicePositions = useMemo(
-    () => positions.filter(p => skippedPositionIds.has(p.id)),
-    [positions, skippedPositionIds],
+    () => positions.filter(p => p.position_type === 'dienstleistung'),
+    [positions],
   )
+
+  // Count component selections per position
+  const componentSelectionCounts = useMemo(() => {
+    const counts: Record<string, number> = {}
+    Object.keys(componentSelections).forEach((key) => {
+      const [positionId] = key.split('::')
+      counts[positionId] = (counts[positionId] ?? 0) + 1
+    })
+    return counts
+  }, [componentSelections])
+
+  const hasAssignment = useCallback((posId: string) => {
+    return (selectedArticleIds[posId]?.length ?? 0) > 0 || (componentSelectionCounts[posId] ?? 0) > 0
+  }, [selectedArticleIds, componentSelectionCounts])
 
   // Filtered positions based on active tab
   const filteredPositions = useMemo(() => {
     switch (activeFilter) {
       case 'zugeordnet':
-        return materialPositions.filter(p => (selectedArticleIds[p.id]?.length ?? 0) > 0)
+        return materialPositions.filter(p => hasAssignment(p.id))
       case 'offen':
-        return materialPositions.filter(p => (selectedArticleIds[p.id]?.length ?? 0) === 0)
+        return materialPositions.filter(p => !hasAssignment(p.id))
       case 'dienstleistung':
         return servicePositions
       default:
         return materialPositions
     }
-  }, [activeFilter, materialPositions, servicePositions, selectedArticleIds])
+  }, [activeFilter, materialPositions, servicePositions, hasAssignment])
 
   // Tab counts
   const assignedCount = useMemo(
-    () => materialPositions.filter(p => (selectedArticleIds[p.id]?.length ?? 0) > 0).length,
-    [materialPositions, selectedArticleIds],
+    () => materialPositions.filter(p => hasAssignment(p.id)).length,
+    [materialPositions, hasAssignment],
   )
   const openCount = useMemo(
-    () => materialPositions.filter(p => (selectedArticleIds[p.id]?.length ?? 0) === 0).length,
-    [materialPositions, selectedArticleIds],
+    () => materialPositions.filter(p => !hasAssignment(p.id)).length,
+    [materialPositions, hasAssignment],
   )
 
   const currentPosition = filteredPositions[currentIndex] ?? null
   const currentSuggestions = currentPosition ? suggestionMap[currentPosition.id] ?? [] : []
   const currentSelectedArticles = currentPosition ? selectedArticleIds[currentPosition.id] ?? [] : []
+  const currentPositionInquiries = useMemo(
+    () => currentPosition ? projectInquiries.filter((inquiry) => inquiry.position_id === currentPosition.id) : [],
+    [projectInquiries, currentPosition],
+  )
+  const currentReceivedInquiries = useMemo(
+    () => currentPositionInquiries.filter((inquiry) => inquiry.status === 'angebot_erhalten'),
+    [currentPositionInquiries],
+  )
   const currentSelectedArticle = currentSelectedArticles[0]
   const additionalArticleIds = useMemo(() => new Set(currentSelectedArticles.slice(1)), [currentSelectedArticles])
+  const offerSourcesByArtikelId = useMemo(
+    () => mapOfferSuggestionSources(currentSuggestions, currentReceivedInquiries),
+    [currentSuggestions, currentReceivedInquiries],
+  )
   // Carousel shows only matching suggestions, not manually added additional articles
   const carouselSuggestions = useMemo(
-    () => currentSuggestions.filter(s => !additionalArticleIds.has(s.artikel_id)),
-    [currentSuggestions, additionalArticleIds],
+    () => prioritizeOfferSuggestions(
+      currentSuggestions.filter((s) => !additionalArticleIds.has(s.artikel_id)),
+      offerSourcesByArtikelId,
+    ),
+    [currentSuggestions, additionalArticleIds, offerSourcesByArtikelId],
   )
   const [addArticleSearchOpen, setAddArticleSearchOpen] = useState(false)
+  const [componentSearchTarget, setComponentSearchTarget] = useState<{ positionId: string; componentName: string } | null>(null)
   const [showRejectConfirm, setShowRejectConfirm] = useState(false)
   const [showOriginalPdf, setShowOriginalPdf] = useState(false)
   const [carouselIndex, setCarouselIndex] = useState(0)
+  const [componentCarouselIndices, setComponentCarouselIndices] = useState<Record<string, number>>({})
   const [swipeDir, setSwipeDir] = useState<'up' | 'down' | null>(null)
+  const [pendingJumpPositionId, setPendingJumpPositionId] = useState<string | null>(null)
+  const progressHydratedRef = useRef(false)
   const totalCount = filteredPositions.length
   const decidedCount = Object.keys(decisions).length
 
@@ -181,12 +330,68 @@ export function AssignmentView({
     setCurrentIndex(0)
   }, [activeFilter])
 
-  // Reset raw text toggle and carousel on position change
+  useEffect(() => {
+    if (!pendingJumpPositionId) return
+    const jumpIndex = filteredPositions.findIndex((position) => position.id === pendingJumpPositionId)
+    if (jumpIndex < 0) return
+    setCurrentIndex(jumpIndex)
+    setPendingJumpPositionId(null)
+  }, [pendingJumpPositionId, filteredPositions])
+
+  useEffect(() => {
+    if (progressHydratedRef.current) return
+    const targetState = persistedUiState ?? { active_filter: 'alle', current_position_id: null, is_finished: false }
+    const targetFilter = targetState.active_filter ?? 'alle'
+
+    if (activeFilter !== targetFilter) {
+      setActiveFilter(targetFilter)
+      return
+    }
+
+    if (targetState.is_finished) {
+      setCurrentIndex(totalCount)
+      progressHydratedRef.current = true
+      return
+    }
+
+    if (targetState.current_position_id) {
+      const targetIndex = filteredPositions.findIndex((position) => position.id === targetState.current_position_id)
+      if (targetIndex >= 0) setCurrentIndex(targetIndex)
+    }
+    progressHydratedRef.current = true
+  }, [persistedUiState, activeFilter, filteredPositions, totalCount])
+
+  useEffect(() => {
+    if (!onUiStateChange) return
+    if (!progressHydratedRef.current) return
+    onUiStateChange({
+      active_filter: activeFilter,
+      current_position_id: isFinished ? null : (currentPosition?.id ?? null),
+      is_finished: isFinished,
+    })
+  }, [activeFilter, isFinished, currentPosition?.id, onUiStateChange])
+
+  // Reset raw text toggle and carousel on position change, auto-select top suggestion
   useEffect(() => {
     setShowOriginalPdf(false)
     setCarouselIndex(0)
     setSwipeDir(null)
-  }, [currentIndex])
+    // Auto-select top suggestion if nothing selected yet
+    const pos = filteredPositions[currentIndex]
+    if (pos && !selectedArticleIds[pos.id]?.length) {
+      const suggestions = suggestionMap[pos.id] ?? []
+      const receivedForPosition = projectInquiries.filter(
+        (inquiry) => inquiry.position_id === pos.id && inquiry.status === 'angebot_erhalten',
+      )
+      const prioritized = prioritizeOfferSuggestions(suggestions, mapOfferSuggestionSources(suggestions, receivedForPosition))
+      const topSuggestion = prioritized[0]
+      if (topSuggestion) {
+        const select = onSilentSelect ?? onAccept
+        select(pos.id, topSuggestion.artikel_id)
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentIndex, projectInquiries])
 
   // Clear swipe animation direction after animation completes
   useEffect(() => {
@@ -196,15 +401,15 @@ export function AssignmentView({
     }
   }, [swipeDir, carouselIndex])
 
-  // Auto-select the currently visible suggestion when swiping
-  // Uses onSwapPrimary to only replace the primary article, keeping additional articles intact
+  // Sync carousel to selected article when selection changes (not on every carousel move)
   useEffect(() => {
-    if (!currentPosition || isServiceView) return
-    const suggestion = carouselSuggestions[carouselIndex]
-    if (suggestion) {
-      onSwapPrimary(currentPosition.id, suggestion.artikel_id)
+    if (!currentSelectedArticle) return
+    const selectedIndex = carouselSuggestions.findIndex((s) => s.artikel_id === currentSelectedArticle)
+    if (selectedIndex >= 0) {
+      setCarouselIndex(selectedIndex)
     }
-  }, [carouselIndex]) // intentionally minimal deps — only fire on carousel swipe
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSelectedArticle, carouselSuggestions])
 
   // Slide animation
   useEffect(() => {
@@ -213,6 +418,27 @@ export function AssignmentView({
       return () => clearTimeout(timer)
     }
   }, [slideDirection])
+
+  useEffect(() => {
+    if (!currentPosition) return
+    const entry = positionSuggestions.find((ps) => ps.position_id === currentPosition.id)
+    const components = entry?.component_suggestions ?? []
+    if (components.length === 0) return
+    setComponentCarouselIndices((prev) => {
+      const next = { ...prev }
+      for (const component of components) {
+        const selectionKey = componentSelectionKey(currentPosition.id, component.component_name)
+        const selectedId = componentSelections[selectionKey]
+        const selectedIndex = component.suggestions.findIndex((s) => s.artikel_id === selectedId)
+        if (selectedIndex >= 0) {
+          next[selectionKey] = selectedIndex
+        } else if (next[selectionKey] == null) {
+          next[selectionKey] = 0
+        }
+      }
+      return next
+    })
+  }, [currentPosition, positionSuggestions, componentSelections])
 
   const goNext = useCallback(() => {
     setSlideDirection('left')
@@ -228,14 +454,66 @@ export function AssignmentView({
 
   const handleSelectArticle = useCallback((artikelId: string) => {
     if (!currentPosition) return
-    onAccept(currentPosition.id, artikelId)
-  }, [currentPosition, onAccept])
+    const select = onSilentSelect ?? onAccept
+    select(currentPosition.id, artikelId)
+  }, [currentPosition, onAccept, onSilentSelect])
+
+  const jumpToPosition = useCallback((positionId: string, targetFilter: FilterTab = 'alle') => {
+    if (activeFilter !== targetFilter) {
+      setActiveFilter(targetFilter)
+    }
+    setPendingJumpPositionId(positionId)
+  }, [activeFilter])
+
+  const suggestionCoverageByPosition = useMemo(() => {
+    const coverage: Record<string, boolean> = {}
+    for (const position of materialPositions) {
+      const hasPrimary = (suggestionMap[position.id]?.length ?? 0) > 0
+      const entry = positionSuggestions.find((ps) => ps.position_id === position.id)
+      const hasComponentSuggestion = (entry?.component_suggestions?.some((cs) => cs.suggestions.length > 0) ?? false)
+      coverage[position.id] = hasPrimary || hasComponentSuggestion
+    }
+    return coverage
+  }, [materialPositions, suggestionMap, positionSuggestions])
+
+  const advanceAfterDecision = useCallback((newDecisions: Record<string, AssignmentDecision>) => {
+    // If on last position or near end, check if there are undecided positions
+    const nextIndex = currentIndex + 1
+    if (nextIndex >= totalCount) {
+      // Check if all material positions decided
+      const hasUndecided = materialPositions.some(p => !newDecisions[p.id])
+      if (hasUndecided) {
+        const firstUndecidedIdx = filteredPositions.findIndex(p => !newDecisions[p.id])
+        if (firstUndecidedIdx >= 0) {
+          setSlideDirection('left')
+          setCurrentIndex(firstUndecidedIdx)
+          return
+        }
+        const firstUndecidedPosition = materialPositions.find((position) => !newDecisions[position.id])
+        if (firstUndecidedPosition) {
+          jumpToPosition(firstUndecidedPosition.id, 'alle')
+          return
+        }
+      }
+    }
+    goNext()
+  }, [currentIndex, totalCount, materialPositions, filteredPositions, goNext, jumpToPosition])
 
   const handleContinue = useCallback(() => {
-    if (!currentPosition || !currentSelectedArticle) return
-    setDecisions(prev => ({ ...prev, [currentPosition.id]: 'accepted' }))
-    goNext()
-  }, [currentPosition, currentSelectedArticle, goNext])
+    if (!currentPosition) return
+    if (!currentSelectedArticle && !hasAssignment(currentPosition.id)) return
+    setDecisionHistory(prev => [...prev, {
+      positionId: currentPosition.id,
+      previousDecision: decisions[currentPosition.id],
+      previousArticleIds: selectedArticleIds[currentPosition.id] ? [...selectedArticleIds[currentPosition.id]] : undefined,
+      previousIndex: currentIndex,
+    }])
+    const newDecisions = { ...decisions, [currentPosition.id]: 'accepted' as const }
+    setDecisions(newDecisions)
+    onDecisionChange?.(currentPosition.id, 'accepted')
+    setPendingInquiries((prev) => prev.filter((inquiry) => inquiry.position_id !== currentPosition.id))
+    advanceAfterDecision(newDecisions)
+  }, [currentPosition, currentSelectedArticle, hasAssignment, advanceAfterDecision, decisions, selectedArticleIds, currentIndex, onDecisionChange])
 
   const handleRejectRequest = useCallback(() => {
     if (!currentPosition) return
@@ -245,20 +523,45 @@ export function AssignmentView({
   const handleRejectConfirm = useCallback(() => {
     if (!currentPosition) return
     setShowRejectConfirm(false)
+    setDecisionHistory(prev => [...prev, {
+      positionId: currentPosition.id,
+      previousDecision: decisions[currentPosition.id],
+      previousArticleIds: selectedArticleIds[currentPosition.id] ? [...selectedArticleIds[currentPosition.id]] : undefined,
+      previousIndex: currentIndex,
+    }])
     onReject(currentPosition.id)
-    setDecisions(prev => ({ ...prev, [currentPosition.id]: 'rejected' }))
-    goNext()
-  }, [currentPosition, onReject, goNext])
+    const newDecisions = { ...decisions, [currentPosition.id]: 'rejected' as const }
+    setDecisions(newDecisions)
+    onDecisionChange?.(currentPosition.id, 'rejected')
+    setPendingInquiries((prev) => prev.filter((inquiry) => inquiry.position_id !== currentPosition.id))
+    advanceAfterDecision(newDecisions)
+  }, [currentPosition, onReject, advanceAfterDecision, decisions, selectedArticleIds, currentIndex, onDecisionChange])
 
   const handleRejectCancel = useCallback(() => {
     setShowRejectConfirm(false)
   }, [])
 
-  const handleSkip = useCallback(() => {
-    if (!currentPosition) return
-    setDecisions(prev => ({ ...prev, [currentPosition.id]: 'skipped' }))
-    goNext()
-  }, [currentPosition, goNext])
+  const handleUndo = useCallback(() => {
+    if (decisionHistory.length === 0) return
+    const last = decisionHistory[decisionHistory.length - 1]
+    setDecisionHistory(prev => prev.slice(0, -1))
+    if (last.previousDecision) {
+      setDecisions(prev => ({ ...prev, [last.positionId]: last.previousDecision! }))
+      onDecisionChange?.(last.positionId, last.previousDecision)
+    } else {
+      setDecisions(prev => {
+        const next = { ...prev }
+        delete next[last.positionId]
+        return next
+      })
+      onDecisionChange?.(last.positionId, undefined)
+    }
+    // Restore previous article selection if it was a reject that cleared it
+    if (last.previousArticleIds && last.previousArticleIds.length > 0) {
+      onAccept(last.positionId, last.previousArticleIds[0])
+    }
+    setCurrentIndex(last.previousIndex)
+  }, [decisionHistory, onAccept, onDecisionChange])
 
   const handleManualSearchSelect = useCallback((product: ProductSearchResult) => {
     if (!currentPosition) return
@@ -272,14 +575,69 @@ export function AssignmentView({
     setAddArticleSearchOpen(false)
   }, [currentPosition, onAddArticle])
 
-  const handleSkipAll = useCallback(() => {
-    filteredPositions.forEach(p => {
-      if (!decisions[p.id]) {
-        setDecisions(prev => ({ ...prev, [p.id]: 'skipped' }))
-      }
-    })
-    setCurrentIndex(totalCount)
-  }, [filteredPositions, decisions, totalCount])
+  const handleComponentSearchSelect = useCallback((product: ProductSearchResult) => {
+    if (!componentSearchTarget || !onComponentManualSelect) return
+    onComponentManualSelect(componentSearchTarget.positionId, componentSearchTarget.componentName, product)
+    setComponentSearchTarget(null)
+  }, [componentSearchTarget, onComponentManualSelect])
+
+  const handleInquirySuccess = useCallback(() => {
+    if (!currentPosition) return
+    const nextDecision: AssignmentDecision = 'inquiry_pending'
+    setDecisionHistory(prev => [...prev, {
+      positionId: currentPosition.id,
+      previousDecision: decisions[currentPosition.id],
+      previousArticleIds: selectedArticleIds[currentPosition.id] ? [...selectedArticleIds[currentPosition.id]] : undefined,
+      previousIndex: currentIndex,
+    }])
+    const newDecisions = { ...decisions, [currentPosition.id]: nextDecision }
+    setDecisions(newDecisions)
+    onDecisionChange?.(currentPosition.id, nextDecision)
+    setInquiryOpen(false)
+    setInquiryProductName(null)
+    if (projectId) {
+      setInquiriesLoading(true)
+      setInquiriesSentResult(null)
+      fetchInquiries(projectId)
+        .then((data) => {
+          setProjectInquiries(data)
+          setPendingInquiries(data.filter((inq) => inq.status === 'offen'))
+        })
+        .catch(() => {
+          setProjectInquiries([])
+          setPendingInquiries([])
+        })
+        .finally(() => setInquiriesLoading(false))
+    }
+    advanceAfterDecision(newDecisions)
+  }, [currentPosition, decisions, selectedArticleIds, currentIndex, onDecisionChange, advanceAfterDecision, projectId])
+
+  const refreshPendingInquiries = useCallback(() => {
+    if (!projectId) {
+      setPendingInquiries([])
+      setProjectInquiries([])
+      return Promise.resolve()
+    }
+    setInquiriesLoading(true)
+    setInquiriesSentResult(null)
+    return fetchInquiries(projectId)
+      .then((data) => {
+        setProjectInquiries(data)
+        setPendingInquiries(data.filter((inq) => inq.status === 'offen'))
+        void onRefreshInquiries?.(projectId)
+      })
+      .catch(() => {
+        setProjectInquiries([])
+        setPendingInquiries([])
+        void onRefreshInquiries?.(projectId)
+      })
+      .finally(() => setInquiriesLoading(false))
+  }, [projectId, onRefreshInquiries])
+
+  useEffect(() => {
+    if (!projectId) return
+    void refreshPendingInquiries()
+  }, [projectId, refreshPendingInquiries])
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -290,7 +648,7 @@ export function AssignmentView({
       switch (e.key) {
         case 'Enter':
           e.preventDefault()
-          if (currentSelectedArticle ?? carouselSuggestions[0]?.artikel_id) {
+          if (currentSelectedArticle || carouselSuggestions[0]?.artikel_id || (currentPosition && hasAssignment(currentPosition.id))) {
             handleContinue()
           }
           break
@@ -300,7 +658,7 @@ export function AssignmentView({
           break
         case 'ArrowRight':
           e.preventDefault()
-          handleSkip()
+          if (currentPosition && decisions[currentPosition.id]) goNext()
           break
         case 'ArrowLeft':
           e.preventDefault()
@@ -309,15 +667,29 @@ export function AssignmentView({
         case 'ArrowUp':
           e.preventDefault()
           if (carouselIndex > 0) {
+            const newIdx = carouselIndex - 1
             setSwipeDir('up')
-            setCarouselIndex(prev => prev - 1)
+            setCarouselIndex(newIdx)
+            if (currentPosition && carouselSuggestions[newIdx]) {
+              handleSelectArticle(carouselSuggestions[newIdx].artikel_id)
+            }
           }
           break
         case 'ArrowDown':
           e.preventDefault()
           if (carouselIndex < carouselSuggestions.length - 1) {
+            const newIdx = carouselIndex + 1
             setSwipeDir('down')
-            setCarouselIndex(prev => prev + 1)
+            setCarouselIndex(newIdx)
+            if (currentPosition && carouselSuggestions[newIdx]) {
+              handleSelectArticle(carouselSuggestions[newIdx].artikel_id)
+            }
+          }
+          break
+        case 'z':
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault()
+            handleUndo()
           }
           break
         case 's':
@@ -329,57 +701,72 @@ export function AssignmentView({
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [isFinished, searchOpen, showRejectConfirm, carouselSuggestions, currentSelectedArticle, carouselIndex, handleContinue, handleRejectRequest, handleSkip, goPrev])
+  }, [isFinished, searchOpen, showRejectConfirm, carouselSuggestions, currentSelectedArticle, carouselIndex, handleContinue, handleRejectRequest, handleUndo, handleSelectArticle, hasAssignment, goPrev, currentPosition, decisions])
 
   // Fetch pending inquiries when assignment is finished
   useEffect(() => {
     if (isFinished && projectId) {
-      setInquiriesLoading(true)
-      setInquiriesSentResult(null)
-      fetchInquiries(projectId)
-        .then(data => setPendingInquiries(data.filter(inq => inq.status === 'offen')))
-        .catch(() => setPendingInquiries([]))
-        .finally(() => setInquiriesLoading(false))
+      refreshPendingInquiries()
     }
-  }, [isFinished, projectId])
+  }, [isFinished, projectId, refreshPendingInquiries])
 
   // Summary screen
   if (isFinished) {
     const acceptedCount = Object.values(decisions).filter(d => d === 'accepted').length
     const rejectedCount = Object.values(decisions).filter(d => d === 'rejected').length
-    const skippedCount = totalCount - acceptedCount - rejectedCount
+    const inquiryPendingCount = Object.values(decisions).filter(d => d === 'inquiry_pending').length
+    const undecidedPositions = materialPositions.filter((position) => !decisions[position.id])
+    const undecidedCount = undecidedPositions.length
+    const undecidedWithSuggestions = undecidedPositions.filter((position) => suggestionCoverageByPosition[position.id])
+    const undecidedWithoutSuggestions = undecidedPositions.filter((position) => !suggestionCoverageByPosition[position.id])
+    const undecidedWithSuggestionsCount = undecidedWithSuggestions.length
+    const undecidedWithoutSuggestionsCount = undecidedWithoutSuggestions.length
     const svcCount = positions.length - materialPositions.length
-    const supplierOpenCount = Object.entries(supplierOpenFlags)
-      .filter(([posId, open]) => open && (selectedArticleIds[posId]?.length ?? 0) > 0)
-      .length
+    const supplierOpenCount = Object.values(supplierOpenFlags).filter(Boolean).length
+    const sentInquiries = projectInquiries.filter((inq) => inq.status === 'angefragt')
+    const receivedInquiries = projectInquiries.filter((inq) => inq.status === 'angebot_erhalten')
+    const hasBlockingInquiries = inquiryPendingCount > 0 || pendingInquiries.length > 0 || sentInquiries.length > 0 || inquiriesLoading
+    const shouldShowInquiryOverview = Boolean(projectId)
+      && (inquiriesLoading || pendingInquiries.length > 0 || sentInquiries.length > 0 || receivedInquiries.length > 0 || inquiryPendingCount > 0)
 
     // Calculate total value
     let totalValue = 0
     for (const [posId, artIds] of Object.entries(selectedArticleIds)) {
-      if (skippedPositionIds.has(posId)) continue
       const suggestions = suggestionMap[posId]
       if (!suggestions) continue
       const position = positions.find(p => p.id === posId)
       for (let i = 0; i < artIds.length; i++) {
         const match = suggestions.find(s => s.artikel_id === artIds[i])
-        const unitPrice = i === 0
-          ? computeAdjustedUnitPrice(match?.price_net, priceAdjustments[posId])
-          : match?.price_net ?? null
+        const assignmentKey = i === 0 ? primaryAssignmentKey(posId) : additionalAssignmentKey(posId, artIds[i])
+        const unitPrice = computeAdjustedUnitPrice(match?.price_net, priceAdjustments[assignmentKey])
         const adjustedTotal = computeAdjustedTotal(unitPrice, position?.quantity)
         if (adjustedTotal != null) totalValue += adjustedTotal
       }
+    }
+    for (const [selectionKey, artikelId] of Object.entries(componentSelections)) {
+      const [positionId, componentName] = selectionKey.split('::')
+      const position = positions.find((p) => p.id === positionId)
+      const entry = positionSuggestions.find((ps) => ps.position_id === positionId)
+      const component = entry?.component_suggestions?.find((cs) => cs.component_name === componentName)
+      const suggestion = component?.suggestions.find((s) => s.artikel_id === artikelId)
+      const unitPrice = computeAdjustedUnitPrice(
+        suggestion?.price_net,
+        priceAdjustments[componentAssignmentKey(positionId, componentName)],
+      )
+      const adjustedTotal = computeAdjustedTotal(unitPrice, position?.quantity)
+      if (adjustedTotal != null) totalValue += adjustedTotal
     }
 
     return (
       <div className="assignment-view">
         <div className="assignment-summary">
           <div className="summary-icon">
-            <svg width="64" height="64" viewBox="0 0 24 24" fill="none">
-              <circle cx="12" cy="12" r="10" stroke="#16a34a" strokeWidth="1.5" />
-              <path d="M8 12l3 3 5-5" stroke="#16a34a" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="10" stroke="var(--accent)" strokeWidth="1.5" />
+              <path d="M8 12l3 3 5-5" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
           </div>
-          <h2>Zuordnung abgeschlossen</h2>
+          <h2>{undecidedCount > 0 ? 'Zuordnung noch offen' : 'Zuordnung abgeschlossen'}</h2>
 
           <div className="summary-stats">
             <div className="summary-stat stat-accepted">
@@ -390,10 +777,12 @@ export function AssignmentView({
               <span className="stat-number">{rejectedCount}</span>
               <span className="stat-label">Ohne Zuordnung</span>
             </div>
-            <div className="summary-stat stat-skipped">
-              <span className="stat-number">{skippedCount}</span>
-              <span className="stat-label">Übersprungen</span>
-            </div>
+            {inquiryPendingCount > 0 && (
+              <div className="summary-stat stat-supplier-open">
+                <span className="stat-number">{inquiryPendingCount}</span>
+                <span className="stat-label">Anfrage offen</span>
+              </div>
+            )}
             {svcCount > 0 && (
               <div className="summary-stat stat-service">
                 <span className="stat-number">{svcCount}</span>
@@ -410,66 +799,138 @@ export function AssignmentView({
 
           {totalValue > 0 && (
             <div className="summary-total">
-              Geschätzter Gesamtwert: {formatMoney(totalValue)}
+              <span className="summary-total-label">Geschätzter Gesamtwert</span>
+              <span className="summary-total-value">{formatMoney(totalValue)}</span>
+            </div>
+          )}
+
+          {undecidedCount > 0 && (
+            <div className="summary-undecided-warning">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <span>{undecidedCount} Position{undecidedCount !== 1 ? 'en' : ''} noch nicht abgeschlossen</span>
+              {undecidedWithSuggestionsCount > 0 && (
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => {
+                    const first = undecidedWithSuggestions[0]
+                    if (first) jumpToPosition(first.id, 'alle')
+                  }}
+                >
+                  Zu Positionen mit Vorschlag ({undecidedWithSuggestionsCount})
+                </button>
+              )}
+              {undecidedWithoutSuggestionsCount > 0 && (
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => {
+                    const first = undecidedWithoutSuggestions[0]
+                    if (first) jumpToPosition(first.id, 'offen')
+                  }}
+                >
+                  Zu offenen ohne Treffer ({undecidedWithoutSuggestionsCount})
+                </button>
+              )}
             </div>
           )}
 
           <div className="summary-actions">
-            <button className="btn btn-secondary" onClick={() => { setCurrentIndex(0); setDecisions({}) }}>
-              Nochmal durchgehen
-            </button>
-            <button className="btn btn-secondary" onClick={onBackToOverview}>
-              Zur Übersicht
-            </button>
-            <button className="btn btn-primary" onClick={onFinish}>
+            <button className="btn btn-primary" onClick={onFinish} disabled={undecidedCount > 0 || hasBlockingInquiries}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M14 2v6h6M16 13H8M16 17H8M10 9H8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
               Angebot exportieren
             </button>
+            {hasBlockingInquiries && (
+              <p className="summary-export-hint">
+                Angebot erst möglich, solange Lieferantenanfragen offen oder ausstehend sind.
+              </p>
+            )}
+            <div className="summary-actions-secondary">
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  setActiveFilter('alle')
+                  setCurrentIndex(0)
+                  setShowInquiryReview(false)
+                }}
+              >
+                Nochmal durchgehen
+              </button>
+              <button className="btn btn-secondary" onClick={onBackToOverview}>
+                Zur Übersicht
+              </button>
+            </div>
           </div>
 
           {/* Inquiry overview */}
-          {projectId && !inquiriesLoading && pendingInquiries.length > 0 && (
+          {shouldShowInquiryOverview && !showInquiryReview && (
             <div className="summary-inquiries">
-              <h3>Offene Lieferantenanfragen</h3>
-              <div className="inquiry-summary-list">
-                {Object.entries(
-                  pendingInquiries.reduce<Record<string, SupplierInquiry[]>>((acc, inq) => {
-                    const key = inq.supplier_name
-                    if (!acc[key]) acc[key] = []
-                    acc[key].push(inq)
-                    return acc
-                  }, {})
-                ).map(([supplierName, inquiries]) => (
-                  <div key={supplierName} className="inquiry-supplier-group">
-                    <span className="inquiry-supplier-name">{supplierName}</span>
-                    <span className="inquiry-count">{inquiries.length} Anfrage{inquiries.length !== 1 ? 'n' : ''}</span>
+              <h3>Lieferantenanfragen</h3>
+              {inquiriesLoading ? (
+                <p className="inquiry-sent-result">Anfragen werden geladen…</p>
+              ) : pendingInquiries.length > 0 ? (
+                <>
+                  <div className="inquiry-summary-list">
+                    {Object.entries(
+                      pendingInquiries.reduce<Record<string, SupplierInquiry[]>>((acc, inq) => {
+                        const key = inq.supplier_name
+                        if (!acc[key]) acc[key] = []
+                        acc[key].push(inq)
+                        return acc
+                      }, {})
+                    ).map(([supplierName, inquiries]) => (
+                      <div key={supplierName} className="inquiry-supplier-group">
+                        <span className="inquiry-supplier-name">{supplierName}</span>
+                        <span className="inquiry-count">{inquiries.length} Anfrage{inquiries.length !== 1 ? 'n' : ''}</span>
+                      </div>
+                    ))}
                   </div>
-                ))}
-              </div>
-              {inquiriesSentResult ? (
-                <p className="inquiry-sent-result">
-                  {inquiriesSentResult.sent} gesendet{inquiriesSentResult.failed > 0 ? `, ${inquiriesSentResult.failed} fehlgeschlagen` : ''}
-                </p>
+                  {inquiriesSentResult ? (
+                    <p className="inquiry-sent-result">
+                      {inquiriesSentResult.sent} gesendet{inquiriesSentResult.failed > 0 ? `, ${inquiriesSentResult.failed} fehlgeschlagen` : ''}
+                    </p>
+                  ) : (
+                    <button
+                      className="btn btn-primary"
+                      onClick={() => setShowInquiryReview(true)}
+                    >
+                      Anfragen prüfen & senden ({pendingInquiries.length})
+                    </button>
+                  )}
+                </>
+              ) : sentInquiries.length > 0 || receivedInquiries.length > 0 ? (
+                <>
+                  <p className="inquiry-sent-result">
+                    {sentInquiries.length} Anfrage{sentInquiries.length !== 1 ? 'n' : ''} wurde{sentInquiries.length !== 1 ? 'n' : ''} versendet.
+                  </p>
+                  {receivedInquiries.length > 0 && (
+                    <p className="inquiry-sent-result">
+                      {receivedInquiries.length} Angebot{receivedInquiries.length !== 1 ? 'e' : ''} bereits erhalten.
+                    </p>
+                  )}
+                </>
               ) : (
-                <button
-                  className="btn btn-primary"
-                  disabled={sendingInquiries}
-                  onClick={async () => {
-                    setSendingInquiries(true)
-                    try {
-                      const result = await sendBatchInquiries(projectId)
-                      setInquiriesSentResult({ sent: result.sent_count, failed: result.failed_count })
-                      setPendingInquiries([])
-                    } catch {
-                      setInquiriesSentResult({ sent: 0, failed: pendingInquiries.length })
-                    } finally {
-                      setSendingInquiries(false)
-                    }
-                  }}
-                >
-                  {sendingInquiries ? 'Wird gesendet...' : `Alle ${pendingInquiries.length} Anfragen absenden`}
-                </button>
+                <p className="inquiry-sent-result">
+                  Für {inquiryPendingCount} Position{inquiryPendingCount !== 1 ? 'en' : ''} sind Anfragen markiert, aktuell aber ohne offenen Status.
+                </p>
               )}
             </div>
+          )}
+
+          {showInquiryReview && projectId && (
+            <InquiryReviewScreen
+              projectId={projectId}
+              pendingInquiries={pendingInquiries}
+              onBack={() => setShowInquiryReview(false)}
+              onSent={(result) => {
+                setInquiriesSentResult(result)
+                setShowInquiryReview(false)
+                void refreshPendingInquiries()
+              }}
+            />
           )}
         </div>
       </div>
@@ -479,8 +940,9 @@ export function AssignmentView({
   const isServiceView = activeFilter === 'dienstleistung'
   const topSuggestion = currentSuggestions[0] ?? null
   const showLoadClass = currentPosition ? LOAD_CLASS_CATEGORIES.has(currentPosition.parameters.product_category ?? '') : false
+  const currentPrimaryAssignmentKey = currentPosition ? primaryAssignmentKey(currentPosition.id) : null
   const currentPriceAdjustment = currentPosition
-    ? priceAdjustments[currentPosition.id] ?? categoryAdjustments[topSuggestion?.category ?? '']
+    ? priceAdjustments[currentPrimaryAssignmentKey ?? ''] ?? categoryAdjustments[topSuggestion?.category ?? '']
     : undefined
   const pricingReferenceSuggestion = currentSuggestions.find((s) => s.artikel_id === currentSelectedArticles[0]) ?? topSuggestion
   const progressPercent = totalCount > 0 ? (currentIndex / totalCount) * 100 : 0
@@ -542,7 +1004,11 @@ export function AssignmentView({
           <div className="progress-bar-fill" style={{ width: `${progressPercent}%` }} />
         </div>
         <div className="progress-shortcuts">
-          Enter = Übernehmen &middot; Esc = Ablehnen &middot; ←→ = Navigation &middot; ↑↓ = Vorschläge &middot; S = Suchen
+          <span><kbd>Enter</kbd> Übernehmen</span>
+          <span><kbd>Esc</kbd> Ablehnen</span>
+          <span><kbd>←→</kbd> Navigation</span>
+          <span><kbd>↑↓</kbd> Vorschläge</span>
+          <span><kbd>S</kbd> Suchen</span>
         </div>
       </div>
 
@@ -559,7 +1025,18 @@ export function AssignmentView({
       {currentPosition && (
         <div className={`assignment-card ${slideDirection === 'left' ? 'slide-out-left' : slideDirection === 'right' ? 'slide-out-right' : 'slide-in'}`}>
           <div className="assignment-position">
-            <div className="position-oz">OZ {currentPosition.ordnungszahl}</div>
+            <div className="position-headline">
+              <div className="position-oz">OZ {currentPosition.ordnungszahl}</div>
+              {decisions[currentPosition.id] && (
+                <span className={`position-decision-badge position-decision-badge--${decisions[currentPosition.id]}`}>
+                  {decisions[currentPosition.id] === 'accepted'
+                    ? 'Bestätigt'
+                    : decisions[currentPosition.id] === 'rejected'
+                      ? 'Abgelehnt'
+                      : 'Anfrage'}
+                </span>
+              )}
+            </div>
             <div className="position-desc">{currentPosition.description}</div>
             <div className="position-params">
               {currentPosition.parameters.nominal_diameter_dn && (
@@ -630,17 +1107,6 @@ export function AssignmentView({
                 </>
               ) : null
             })()}
-            {!isServiceView && currentSelectedArticles.length > 0 && onToggleAlternative && (
-              <label className={`alt-check-label ${alternativeFlags[currentPosition.id] ? 'alt-active' : ''}`}>
-                <input
-                  type="checkbox"
-                  checked={alternativeFlags[currentPosition.id] ?? false}
-                  onChange={() => onToggleAlternative(currentPosition.id)}
-                />
-                <span>Alternativ z. baus. Prüfung</span>
-                {alternativeFlags[currentPosition.id] && <span className="alt-badge">ALT</span>}
-              </label>
-            )}
             {isServiceView && (
               <div className="service-badge-info">Dienstleistung — nicht im Angebot enthalten</div>
             )}
@@ -657,30 +1123,22 @@ export function AssignmentView({
             </div>
           )}
 
-          {!isServiceView && currentPosition && pricingReferenceSuggestion && (
-            <PriceAdjustmentControl
-              adjustment={currentPriceAdjustment}
-              baseUnitPrice={pricingReferenceSuggestion.price_net}
-              quantity={currentPosition.quantity}
-              currency={pricingReferenceSuggestion.currency}
-              onChange={(next) => onPriceAdjustmentChange(currentPosition.id, next)}
-            />
-          )}
-
-          {/* Multi-component position */}
+          {/* Multi-component position — same card design as single suggestions */}
           {!isServiceView && isMultiComponent && currentPosition && currentComponentSuggestions && (
-            <div className="multi-component-section">
-              <div className="multi-component-badge">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                  <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                Mehrkomponenten-Position ({currentComponentSuggestions.length} Teile)
+            <div className="assignment-carousel-unified">
+              <div className="carousel-header">
+                <span className="carousel-title multi-component-label">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                    <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  {currentComponentSuggestions.length} Komponenten
+                </span>
               </div>
               {(() => {
                 // DN consistency check
                 const dns = currentComponentSuggestions
                   .map(cs => {
-                    const selKey = `${currentPosition.id}::${cs.component_name}`
+                    const selKey = componentSelectionKey(currentPosition.id, cs.component_name)
                     const selId = componentSelections[selKey]
                     const selSugg = selId ? cs.suggestions.find(s => s.artikel_id === selId) : cs.suggestions[0]
                     return selSugg?.dn
@@ -697,67 +1155,144 @@ export function AssignmentView({
                   </div>
                 ) : null
               })()}
-              <div className="component-list">
-                {currentComponentSuggestions.map(cs => {
-                  const selKey = `${currentPosition.id}::${cs.component_name}`
-                  const selectedId = componentSelections[selKey]
-                  const topComp = cs.suggestions[0]
-                  const selectedSugg = selectedId ? cs.suggestions.find(s => s.artikel_id === selectedId) ?? topComp : topComp
+              {currentComponentSuggestions.map((cs, csIndex) => {
+                const selKey = componentSelectionKey(currentPosition.id, cs.component_name)
+                const selectedId = componentSelections[selKey]
+                const topComp = cs.suggestions[0]
+                const componentIndex = componentCarouselIndices[selKey] ?? 0
+                const visibleSuggestion = cs.suggestions[componentIndex] ?? topComp
+                const componentPriceKey = componentAssignmentKey(currentPosition.id, cs.component_name)
+                const componentPriceAdjustment = priceAdjustments[componentPriceKey]
 
-                  return (
-                    <div key={cs.component_name} className="component-card">
-                      <div className="component-card-header">
-                        <span className="component-name">{cs.component_name}</span>
-                        <span className="component-qty">{cs.quantity}x</span>
-                      </div>
-                      {cs.suggestions.length > 0 && selectedSugg ? (
-                        <div className="component-match">
-                          <div className="component-match-info">
-                            <span className="component-article-name">{selectedSugg.artikelname}</span>
-                            <span className="component-article-meta">
-                              {selectedSugg.artikel_id}
-                              {selectedSugg.hersteller && <> &middot; {selectedSugg.hersteller}</>}
-                              {selectedSugg.dn != null && <> &middot; DN{selectedSugg.dn}</>}
-                            </span>
-                            {selectedSugg.price_net != null && (
-                              <span className="component-article-price">
-                                {formatMoney(selectedSugg.price_net)} / Einheit
-                              </span>
-                            )}
-                          </div>
-                          {cs.suggestions.length > 1 && (
-                            <select
-                              className="component-select"
-                              value={selectedId ?? topComp?.artikel_id ?? ''}
-                              onChange={e => onComponentSelect?.(currentPosition.id, cs.component_name, e.target.value)}
-                            >
-                              {cs.suggestions.map(s => (
-                                <option key={s.artikel_id} value={s.artikel_id}>
-                                  {s.artikelname} ({formatMoney(s.price_net)})
-                                </option>
-                              ))}
-                            </select>
-                          )}
+                return (
+                  <div key={cs.component_name} className="component-block">
+                    <div className="component-separator">
+                      <span className="component-separator-label">{cs.component_name}</span>
+                      <span className="component-separator-qty">{cs.quantity}x</span>
+                      {cs.suggestions.length > 1 && (
+                        <div className="carousel-nav-compact">
+                          <button
+                            className="carousel-arrow-sm"
+                            disabled={componentIndex === 0}
+                            onClick={() => {
+                              const newIdx = Math.max((componentCarouselIndices[selKey] ?? componentIndex) - 1, 0)
+                              setComponentCarouselIndices((prev) => ({ ...prev, [selKey]: newIdx }))
+                              if (cs.suggestions[newIdx]) onComponentSelect?.(currentPosition.id, cs.component_name, cs.suggestions[newIdx].artikel_id)
+                            }}
+                            title="Vorheriger Vorschlag"
+                          >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                              <path d="M18 15l-6-6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                          </button>
+                          <span className="carousel-indicator">{componentIndex + 1} / {cs.suggestions.length}</span>
+                          <button
+                            className="carousel-arrow-sm"
+                            disabled={componentIndex >= cs.suggestions.length - 1}
+                            onClick={() => {
+                              const newIdx = Math.min((componentCarouselIndices[selKey] ?? componentIndex) + 1, cs.suggestions.length - 1)
+                              setComponentCarouselIndices((prev) => ({ ...prev, [selKey]: newIdx }))
+                              if (cs.suggestions[newIdx]) onComponentSelect?.(currentPosition.id, cs.component_name, cs.suggestions[newIdx].artikel_id)
+                            }}
+                            title="Nächster Vorschlag"
+                          >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                              <path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                          </button>
                         </div>
-                      ) : (
-                        <div className="component-no-match">Kein passender Artikel</div>
                       )}
                     </div>
-                  )
-                })}
-              </div>
-              <div className="top-actions">
-                <button className="btn btn-accept" onClick={handleContinue}>
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                    <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                    {visibleSuggestion ? (
+                      <>
+                        {selectedId && (() => {
+                          const selectedSugg = cs.suggestions.find(s => s.artikel_id === selectedId) ?? visibleSuggestion
+                          return (
+                            <PriceAdjustmentControl
+                              adjustment={componentPriceAdjustment}
+                              baseUnitPrice={selectedSugg.price_net}
+                              quantity={currentPosition.quantity}
+                              currency={selectedSugg.currency}
+                              onChange={(next) => onPriceAdjustmentChange(componentPriceKey, next)}
+                            />
+                          )
+                        })()}
+                        {renderSuggestionCard(
+                          visibleSuggestion,
+                          currentPosition,
+                          showLoadClass,
+                          csIndex === 0,
+                          undefined,
+                          selectedId ? [selectedId] : [],
+                          () => onComponentSelect?.(currentPosition.id, cs.component_name, visibleSuggestion.artikel_id),
+                        )}
+                        {selectedId && (
+                          <div className="card-flags">
+                            {onToggleAlternative && (
+                              <label className={`flag-toggle ${alternativeFlags[componentPriceKey] ? 'flag-active flag-warn' : ''}`}>
+                                <input
+                                  type="checkbox"
+                                  checked={alternativeFlags[componentPriceKey] ?? false}
+                                  onChange={() => onToggleAlternative(componentPriceKey)}
+                                />
+                                Alt. z. baus. Prüfung
+                                {alternativeFlags[componentPriceKey] && <span className="flag-badge flag-badge-warn">ALT</span>}
+                              </label>
+                            )}
+                            {onToggleSupplierOpen && (
+                              <label className={`flag-toggle ${supplierOpenFlags[componentPriceKey] ? 'flag-active flag-blue' : ''}`}>
+                                <input
+                                  type="checkbox"
+                                  checked={supplierOpenFlags[componentPriceKey] ?? false}
+                                  onChange={() => onToggleSupplierOpen(componentPriceKey)}
+                                />
+                                Lieferant offen
+                                {supplierOpenFlags[componentPriceKey] && <span className="flag-badge flag-badge-blue">OFFEN</span>}
+                              </label>
+                            )}
+                          </div>
+                        )}
+                        {cs.suggestions.length > 1 && (
+                          <div className="carousel-dots">
+                            {cs.suggestions.map((_, i) => (
+                              <button
+                                key={i}
+                                className={`carousel-dot ${i === componentIndex ? 'active' : ''}`}
+                                onClick={() => {
+                                  setComponentCarouselIndices((prev) => ({ ...prev, [selKey]: i }))
+                                  if (cs.suggestions[i]) onComponentSelect?.(currentPosition.id, cs.component_name, cs.suggestions[i].artikel_id)
+                                }}
+                              />
+                            ))}
+                          </div>
+                        )}
+                        <div className="assignment-card-tools">
+                          <button
+                            className="btn btn-ghost assignment-search-btn"
+                            onClick={() => setComponentSearchTarget({ positionId: currentPosition.id, componentName: cs.component_name })}
+                          >
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                              <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
+                              <path d="M21 21l-4.35-4.35" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                            </svg>
+                            Manuell suchen
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="assignment-no-match assignment-no-match--compact">
+                        <p>Kein passender Artikel</p>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+              <div className="assignment-card-tools assignment-card-tools--row">
+                <button className="btn btn-ghost assignment-search-btn" onClick={() => setAddArticleSearchOpen(true)}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                    <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
                   </svg>
-                  Alle Komponenten übernehmen
-                </button>
-                <button className="btn btn-reject" onClick={handleRejectRequest}>
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                    <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
-                  </svg>
-                  Ablehnen
+                  Artikel hinzufügen
                 </button>
               </div>
             </div>
@@ -766,6 +1301,15 @@ export function AssignmentView({
           {/* Unified suggestion carousel — all suggestions in one swipeable view */}
           {!isServiceView && !isMultiComponent && carouselSuggestions.length > 0 && (
             <div className="assignment-carousel-unified">
+              {currentPrimaryAssignmentKey && currentSelectedArticle && pricingReferenceSuggestion && (
+                <PriceAdjustmentControl
+                  adjustment={currentPriceAdjustment}
+                  baseUnitPrice={pricingReferenceSuggestion.price_net}
+                  quantity={currentPosition.quantity}
+                  currency={pricingReferenceSuggestion.currency}
+                  onChange={(next) => onPriceAdjustmentChange(currentPrimaryAssignmentKey, next)}
+                />
+              )}
               <div className="carousel-header">
                 <span className="carousel-title">
                   {carouselIndex === 0 ? 'Bester Vorschlag' : `Vorschlag ${carouselIndex + 1}`}
@@ -774,7 +1318,7 @@ export function AssignmentView({
                   <button
                     className="carousel-arrow-sm"
                     disabled={carouselIndex === 0}
-                    onClick={() => { setSwipeDir('up'); setCarouselIndex(prev => prev - 1) }}
+                    onClick={() => { const i = carouselIndex - 1; setSwipeDir('up'); setCarouselIndex(i); if (carouselSuggestions[i]) handleSelectArticle(carouselSuggestions[i].artikel_id) }}
                     title="Vorheriger Vorschlag (↑)"
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
@@ -785,7 +1329,7 @@ export function AssignmentView({
                   <button
                     className="carousel-arrow-sm"
                     disabled={carouselIndex >= carouselSuggestions.length - 1}
-                    onClick={() => { setSwipeDir('down'); setCarouselIndex(prev => prev + 1) }}
+                    onClick={() => { const i = carouselIndex + 1; setSwipeDir('down'); setCarouselIndex(i); if (carouselSuggestions[i]) handleSelectArticle(carouselSuggestions[i].artikel_id) }}
                     title="Nächster Vorschlag (↓)"
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
@@ -803,79 +1347,94 @@ export function AssignmentView({
                   currentPosition,
                   showLoadClass,
                   carouselIndex === 0,
-                  currentPriceAdjustment,
+                  undefined,
                   currentSelectedArticles,
                   () => handleSelectArticle(carouselSuggestions[carouselIndex].artikel_id),
                   () => {
                     setInquiryProductName(carouselSuggestions[carouselIndex].artikelname)
                     setInquiryOpen(true)
                   },
+                  offerSourcesByArtikelId[carouselSuggestions[carouselIndex].artikel_id],
                 )}
               </div>
+              {currentPrimaryAssignmentKey && currentSelectedArticle && (
+                <div className="card-flags">
+                  {onToggleAlternative && (
+                    <label className={`flag-toggle ${alternativeFlags[currentPrimaryAssignmentKey] ? 'flag-active flag-warn' : ''}`}>
+                      <input
+                        type="checkbox"
+                        checked={alternativeFlags[currentPrimaryAssignmentKey] ?? false}
+                        onChange={() => onToggleAlternative(currentPrimaryAssignmentKey)}
+                      />
+                      Alt. z. baus. Prüfung
+                      {alternativeFlags[currentPrimaryAssignmentKey] && <span className="flag-badge flag-badge-warn">ALT</span>}
+                    </label>
+                  )}
+                  {onToggleSupplierOpen && (
+                    <label className={`flag-toggle ${supplierOpenFlags[currentPrimaryAssignmentKey] ? 'flag-active flag-blue' : ''}`}>
+                      <input
+                        type="checkbox"
+                        checked={supplierOpenFlags[currentPrimaryAssignmentKey] ?? false}
+                        onChange={() => onToggleSupplierOpen(currentPrimaryAssignmentKey)}
+                      />
+                      Lieferant offen
+                      {supplierOpenFlags[currentPrimaryAssignmentKey] && <span className="flag-badge flag-badge-blue">OFFEN</span>}
+                    </label>
+                  )}
+                </div>
+              )}
               {carouselSuggestions.length > 1 && (
                 <div className="carousel-dots">
                   {carouselSuggestions.map((_, i) => (
                     <button
                       key={i}
                       className={`carousel-dot ${i === carouselIndex ? 'active' : ''}`}
-                      onClick={() => { setSwipeDir(i > carouselIndex ? 'down' : 'up'); setCarouselIndex(i) }}
+                      onClick={() => { setSwipeDir(i > carouselIndex ? 'down' : 'up'); setCarouselIndex(i); if (carouselSuggestions[i]) handleSelectArticle(carouselSuggestions[i].artikel_id) }}
                     />
                   ))}
                 </div>
               )}
-              <div className="top-actions">
-                <button className="btn btn-accept" onClick={handleContinue} disabled={!currentSelectedArticle}>
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                    <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                  Übernehmen & weiter
-                </button>
-                <button className="btn btn-reject" onClick={handleRejectRequest}>
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                    <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
-                  </svg>
-                  Ablehnen
-                </button>
-                {currentPosition && onToggleSupplierOpen && (
-                  <label className="supplier-open-toggle">
-                    <input
-                      type="checkbox"
-                      checked={supplierOpenFlags[currentPosition.id] ?? false}
-                      onChange={() => onToggleSupplierOpen(currentPosition.id)}
-                    />
-                    Lieferant offen
-                  </label>
-                )}
-              </div>
-            </div>
-          )}
-
-          {!isServiceView && !isMultiComponent && carouselSuggestions.length === 0 && (
-            <div className="assignment-no-match">
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none">
-                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.5" />
-                <path d="M8 12h8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-              </svg>
-              <p>Kein passender Artikel gefunden</p>
-              <div className="top-actions">
-                <button className="btn btn-primary" onClick={() => setSearchOpen(true)}>
+              <div className="assignment-card-tools">
+                <button className="btn btn-ghost assignment-search-btn" onClick={() => setSearchOpen(true)}>
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
                     <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
                     <path d="M21 21l-4.35-4.35" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
                   </svg>
                   Manuell suchen
                 </button>
-                <button className="btn btn-ghost btn-inquiry" onClick={() => setInquiryOpen(true)}>
+                <button className="btn btn-ghost assignment-search-btn" onClick={() => setInquiryOpen(true)}>
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
                     <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                   </svg>
                   Lieferantenanfrage
                 </button>
-                <button className="btn btn-reject" onClick={handleRejectRequest}>
+              </div>
+            </div>
+          )}
+
+          {!isServiceView && !isMultiComponent && carouselSuggestions.length === 0 && (
+            <div className="assignment-no-match">
+              <div className="no-match-icon">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+                  <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="1.5" />
+                  <path d="M21 21l-4.35-4.35" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                  <path d="M8 11h6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                </svg>
+              </div>
+              <p>Kein passender Artikel gefunden</p>
+              <div className="no-match-actions">
+                <button className="btn btn-ghost assignment-search-btn" onClick={() => setSearchOpen(true)}>
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                    <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+                    <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
+                    <path d="M21 21l-4.35-4.35" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
                   </svg>
-                  Ablehnen
+                  Manuell suchen
+                </button>
+                <button className="btn btn-ghost assignment-search-btn" onClick={() => setInquiryOpen(true)}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                    <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  Lieferantenanfrage
                 </button>
               </div>
             </div>
@@ -889,7 +1448,9 @@ export function AssignmentView({
             return additionalArts.length > 0 ? (
               <div className="additional-articles-section">
                 <div className="additional-articles-header">Zusatzartikel</div>
-                {additionalArts.map(art => (
+                {additionalArts.map(art => {
+                  const assignmentKey = additionalAssignmentKey(currentPosition.id, art.artikel_id)
+                  return (
                   <div key={art.artikel_id} className="additional-article-card">
                     <div className="additional-article-info">
                       <span className="additional-article-plus">+</span>
@@ -901,56 +1462,88 @@ export function AssignmentView({
                           {art.price_net != null && <> &middot; {new Intl.NumberFormat('de-DE', { style: 'currency', currency: art.currency ?? 'EUR' }).format(art.price_net)} / Einheit</>}
                         </span>
                       </div>
+                      <button
+                        className="additional-article-remove"
+                        title="Zusatzartikel entfernen"
+                        onClick={() => onRemoveArticle(currentPosition!.id, art.artikel_id)}
+                      >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                          <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+                        </svg>
+                      </button>
                     </div>
-                    <button
-                      className="btn-icon-tiny"
-                      title="Entfernen"
-                      onClick={() => onRemoveArticle(currentPosition!.id, art.artikel_id)}
-                    >
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none">
-                        <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
-                      </svg>
-                    </button>
+                    <div className="card-flags">
+                      {onToggleAlternative && (
+                        <label className={`flag-toggle ${alternativeFlags[assignmentKey] ? 'flag-active flag-warn' : ''}`}>
+                          <input
+                            type="checkbox"
+                            checked={alternativeFlags[assignmentKey] ?? false}
+                            onChange={() => onToggleAlternative(assignmentKey)}
+                          />
+                          Alt. z. baus. Prüfung
+                          {alternativeFlags[assignmentKey] && <span className="flag-badge flag-badge-warn">ALT</span>}
+                        </label>
+                      )}
+                      {onToggleSupplierOpen && (
+                        <label className={`flag-toggle ${supplierOpenFlags[assignmentKey] ? 'flag-active flag-blue' : ''}`}>
+                          <input
+                            type="checkbox"
+                            checked={supplierOpenFlags[assignmentKey] ?? false}
+                            onChange={() => onToggleSupplierOpen(assignmentKey)}
+                          />
+                          Lieferant offen
+                          {supplierOpenFlags[assignmentKey] && <span className="flag-badge flag-badge-blue">OFFEN</span>}
+                        </label>
+                      )}
+                    </div>
+                    <PriceAdjustmentControl
+                      adjustment={priceAdjustments[assignmentKey]}
+                      baseUnitPrice={art.price_net}
+                      quantity={currentPosition.quantity}
+                      currency={art.currency}
+                      onChange={(next) => onPriceAdjustmentChange(assignmentKey, next)}
+                    />
                   </div>
-                ))}
+                )})}
               </div>
             ) : null
           })()}
 
-          {/* Manual search & add article buttons */}
-          {!isServiceView && carouselSuggestions.length > 0 && (
-            <div className="assignment-bottom-actions">
-              <button className="btn btn-ghost assignment-search-btn" onClick={() => setSearchOpen(true)}>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                  <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
-                  <path d="M21 21l-4.35-4.35" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                </svg>
-                Manuell suchen
-              </button>
-              {currentSelectedArticles.length > 0 && (
-                <button className="btn btn-ghost assignment-search-btn" onClick={() => setAddArticleSearchOpen(true)}>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                    <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                  </svg>
-                  Artikel hinzufügen
-                </button>
+          {/* Accept / Reject — always at the bottom */}
+          {!isServiceView && currentPosition && (
+            <div className="assignment-action-bar">
+              {(currentSelectedArticle || hasAssignment(currentPosition.id)) && (
+                <div className="assignment-card-tools">
+                  <button className="btn btn-ghost assignment-search-btn" onClick={() => setAddArticleSearchOpen(true)}>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                      <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                    </svg>
+                    Artikel hinzufügen
+                  </button>
+                </div>
               )}
+              <div className="action-bar-main">
+                <button className="btn btn-accept" onClick={handleContinue} disabled={!currentSelectedArticle && !hasAssignment(currentPosition.id)}>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                    <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  Übernehmen & weiter
+                </button>
+                <button className="btn btn-reject" onClick={handleRejectRequest}>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                    <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+                  </svg>
+                  Ablehnen
+                </button>
+              </div>
             </div>
           )}
         </div>
       )}
 
-      {/* Navigation — single row, no duplicate skip */}
+      {/* Navigation — back, forward (if decided), undo */}
       {totalCount > 0 && (
         <div className="assignment-nav">
-          <button
-            className="btn btn-primary"
-            onClick={handleContinue}
-            disabled={!currentSelectedArticle || isServiceView}
-          >
-            Übernehmen & weiter
-          </button>
-
           <button
             className="btn btn-ghost"
             onClick={goPrev}
@@ -962,16 +1555,24 @@ export function AssignmentView({
             Zurück
           </button>
 
-          <button className="btn btn-ghost" onClick={handleSkip}>
-            Überspringen
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-              <path d="M9 18l6-6-6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </button>
+          {currentPosition && decisions[currentPosition.id] && (
+            <button className="btn btn-ghost" onClick={goNext} disabled={currentIndex >= totalCount - 1}>
+              Weiter
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path d="M9 18l6-6-6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+          )}
 
-          <button className="btn btn-ghost btn-skip-all" onClick={handleSkipAll}>
-            Alle offenen überspringen
-          </button>
+          {decisionHistory.length > 0 && (
+            <button className="btn btn-ghost btn-undo" onClick={handleUndo} title="Letzte Entscheidung rückgängig machen (Strg+Z)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path d="M3 10h10a5 5 0 015 5v0a5 5 0 01-5 5H8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M7 14l-4-4 4-4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Rückgängig
+            </button>
+          )}
         </div>
       )}
 
@@ -1006,6 +1607,11 @@ export function AssignmentView({
             isOpen={addArticleSearchOpen}
             onClose={() => setAddArticleSearchOpen(false)}
             onSelect={handleAddArticleSelect}
+          />
+          <ProductSearchModal
+            isOpen={componentSearchTarget != null}
+            onClose={() => setComponentSearchTarget(null)}
+            onSelect={handleComponentSearchSelect}
             initialCategory={currentPosition.parameters.product_category}
             initialDn={currentPosition.parameters.nominal_diameter_dn}
           />
@@ -1016,6 +1622,7 @@ export function AssignmentView({
             projectId={projectId}
             projectName={projectName}
             productDescription={inquiryProductName}
+            onSuccess={handleInquirySuccess}
           />
         </>
       )}
@@ -1032,6 +1639,7 @@ function renderSuggestionCard(
   currentSelectedArticles: string[],
   onSelect: () => void,
   onInquiry?: () => void,
+  offerSourceSupplier?: string,
 ) {
   const stock = stockStatus(suggestion.stock)
   const isSelected = currentSelectedArticles.includes(suggestion.artikel_id)
@@ -1039,7 +1647,9 @@ function renderSuggestionCard(
   const adjustedTotal = computeAdjustedTotal(adjustedUnitPrice, position.quantity)
   const isPrimary = currentSelectedArticles[0] === suggestion.artikel_id
   const showAdjusted = isPrimary && isAdjustedPrice(suggestion.price_net, adjustedUnitPrice)
-  const hasWarnings = suggestion.warnings.length > 0
+  const filteredWarnings = filterSuggestionWarnings(suggestion.warnings)
+  const filteredReasons = filterSuggestionReasons(suggestion.reasons)
+  const hasWarnings = filteredWarnings.length > 0
 
   return (
     <div
@@ -1050,11 +1660,13 @@ function renderSuggestionCard(
         <div className="suggestion-title-group">
           {suggestion.is_manual && <span className="manual-badge">Manuell gewählt</span>}
           {suggestion.is_override && <span className="override-badge">Häufig gewählt von Kollegen</span>}
-          {isTop && !suggestion.is_manual && !suggestion.is_override && <span className="best-badge">Bester Treffer</span>}
+          {suggestion.is_supplier_offer && <span className="offer-source-badge">Lieferantenangebot{suggestion.supplier_name ? ` · ${suggestion.supplier_name}` : ''}</span>}
+          {!suggestion.is_supplier_offer && offerSourceSupplier && <span className="offer-source-badge">Aus Lieferantenangebot{offerSourceSupplier ? ` · ${offerSourceSupplier}` : ''}</span>}
+          {isTop && !suggestion.is_manual && !suggestion.is_override && !suggestion.is_supplier_offer && <span className="best-badge">Bester Treffer</span>}
           <strong className="suggestion-name">{suggestion.artikelname}</strong>
         </div>
         <div className="suggestion-header-actions">
-          {!suggestion.is_manual && !suggestion.is_override && suggestion.score_breakdown.length > 0 ? (
+          {!suggestion.is_manual && !suggestion.is_override && !suggestion.is_supplier_offer && suggestion.score_breakdown.length > 0 ? (
             <details className="score-details" onClick={(e) => e.stopPropagation()}>
               <summary
                 className="score-badge"
@@ -1088,9 +1700,18 @@ function renderSuggestionCard(
       </div>
 
       <div className="suggestion-meta">
-        <span>{suggestion.artikel_id}</span>
-        <span className="meta-sep" />
-        <span>{suggestion.hersteller ?? 'Unbekannt'}</span>
+        {suggestion.is_supplier_offer ? (
+          <>
+            <span>{suggestion.hersteller ?? 'Lieferant'}</span>
+            {suggestion.supplier_offer_id && <><span className="meta-sep" /><span>Angebot #{suggestion.supplier_offer_id}</span></>}
+          </>
+        ) : (
+          <>
+            <span>{suggestion.artikel_id}</span>
+            <span className="meta-sep" />
+            <span>{suggestion.hersteller ?? 'Unbekannt'}</span>
+          </>
+        )}
       </div>
 
       <div className="param-badges">
@@ -1116,13 +1737,8 @@ function renderSuggestionCard(
           label={suggestion.load_class}
           status={!position.parameters.load_class ? 'neutral' : position.parameters.load_class.toUpperCase() === suggestion.load_class.toUpperCase() ? 'match' : 'mismatch'}
         />}
-        {suggestion.norm && (
-          <span className={`param-badge param-${!position.parameters.norm ? 'neutral' : suggestion.norm.toLowerCase().includes(position.parameters.norm.toLowerCase()) ? 'match' : 'mismatch'}`}
-            style={{
-              ...PARAM_STYLES[!position.parameters.norm ? 'neutral' : suggestion.norm.toLowerCase().includes(position.parameters.norm.toLowerCase()) ? 'match' : 'mismatch'],
-              padding: '2px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 600,
-            }}
-          >
+        {shouldShowNormBadge(position, suggestion) && suggestion.norm && (
+          <span className={`param-badge param-${!position.parameters.norm ? 'neutral' : suggestion.norm.toLowerCase().includes(position.parameters.norm.toLowerCase()) ? 'match' : 'mismatch'}`}>
             <DinBadge norm={suggestion.norm} />
           </span>
         )}
@@ -1178,17 +1794,16 @@ function renderSuggestionCard(
 
       {hasWarnings && (
         <div className="suggestion-warnings">
-          {suggestion.warnings.map(w => (
+          {filteredWarnings.map(w => (
             <span key={w} className="warning-chip">{w}</span>
           ))}
         </div>
       )}
 
-      {suggestion.reasons.length > 0 && !suggestion.is_manual && (() => {
-        const filtered = suggestion.reasons.filter(r => !r.toLowerCase().includes('lager'))
-        return filtered.length > 0 ? (
+      {filteredReasons.length > 0 && (() => {
+        return filteredReasons.length > 0 ? (
           <div className="reason-chips">
-            {filtered.map((reason) => {
+            {filteredReasons.map((reason) => {
               const lower = reason.toLowerCase()
               const isNegative = lower.includes('abweichend') || lower.includes('weicht ab') || lower.includes('unter ') || lower.includes('≠') || lower.includes('kein') || lower.includes('nicht') || lower.includes('ohne') || lower.includes('fehlt')
               return (

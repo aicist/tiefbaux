@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
-import type { LVPosition, ProductSuggestion } from '../types'
+import type { LVPosition, PositionSuggestions, ProductSuggestion, SupplierInquiry } from '../types'
 import { DinBadge } from './DinBadge'
 
-type FilterMode = 'alle' | 'zugeordnet' | 'offen' | 'dienstleistung'
+type FilterMode = 'alle' | 'zugeordnet' | 'offen' | 'angefragt' | 'bestaetigt' | 'abgelehnt' | 'dienstleistung'
 
 const LOAD_CLASS_CATEGORIES = new Set(['Schachtabdeckungen', 'Straßenentwässerung'])
 
@@ -11,10 +11,15 @@ type Props = {
   activePositionId: string | null
   onSelectPosition: (id: string) => void
   selectedArticleIds: Record<string, string[]>
+  positionDecisions?: Record<string, 'accepted' | 'rejected' | 'inquiry_pending'>
+  pendingInquiryPositionIds?: string[]
+  componentSelections?: Record<string, string>
   suggestionMap: Record<string, ProductSuggestion[]>
-  skippedPositionIds: Set<string>
-  onToggleSkip: (positionId: string) => void
+  positionSuggestions?: PositionSuggestions[]
   onEnterAssignment?: () => void
+  showAssignmentDetails?: boolean
+  inquiries?: SupplierInquiry[]
+  onEditPosition?: (positionId: string) => void
 }
 
 function formatQty(value?: number | null): string {
@@ -23,30 +28,109 @@ function formatQty(value?: number | null): string {
   return value.toLocaleString('de-DE', { maximumFractionDigits: 3 })
 }
 
+function formatPrice(value?: number | null): string {
+  if (value == null) return '—'
+  return value.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €'
+}
+
 export function PositionsList({
   positions,
   activePositionId,
   onSelectPosition,
   selectedArticleIds,
+  positionDecisions = {},
+  pendingInquiryPositionIds = [],
+  componentSelections = {},
   suggestionMap,
-  skippedPositionIds,
-  onToggleSkip,
+  positionSuggestions = [],
   onEnterAssignment,
+  showAssignmentDetails = false,
+  inquiries = [],
+  onEditPosition,
 }: Props) {
   const pageSize = 10
   const [searchTerm, setSearchTerm] = useState('')
   const [filterMode, setFilterMode] = useState<FilterMode>('alle')
   const [currentPage, setCurrentPage] = useState(0)
 
+  const componentSelectionCounts = useMemo(() => {
+    const counts: Record<string, number> = {}
+    Object.keys(componentSelections).forEach((key) => {
+      const [positionId] = key.split('::')
+      counts[positionId] = (counts[positionId] ?? 0) + 1
+    })
+    return counts
+  }, [componentSelections])
+
+  const componentSuggestionCounts = useMemo(() => {
+    const counts: Record<string, number> = {}
+    positionSuggestions.forEach((entry) => {
+      const count = entry.component_suggestions?.filter((cs) => cs.suggestions.length > 0).length ?? 0
+      if (count > 0) counts[entry.position_id] = count
+    })
+    return counts
+  }, [positionSuggestions])
+
+  const pendingInquirySet = useMemo(
+    () => new Set(pendingInquiryPositionIds),
+    [pendingInquiryPositionIds],
+  )
+
+  const inquiriesByPosition = useMemo(() => {
+    const map: Record<string, SupplierInquiry[]> = {}
+    for (const inq of inquiries) {
+      if (inq.position_id) {
+        ;(map[inq.position_id] ??= []).push(inq)
+      }
+    }
+    return map
+  }, [inquiries])
+
+  const inquiryPositionSet = useMemo(
+    () => new Set(Object.keys(inquiriesByPosition)),
+    [inquiriesByPosition],
+  )
+
+  // Counts for filters
+  const serviceCount = useMemo(() => positions.filter(p => p.position_type === 'dienstleistung').length, [positions])
+  const assignedCount = useMemo(
+    () => positions.filter((p) => ((selectedArticleIds[p.id]?.length ?? 0) > 0 || (componentSelectionCounts[p.id] ?? 0) > 0) && p.position_type !== 'dienstleistung').length,
+    [positions, selectedArticleIds, componentSelectionCounts],
+  )
+  const rejectedCount = useMemo(
+    () => positions.filter((p) => p.position_type !== 'dienstleistung' && positionDecisions[p.id] === 'rejected').length,
+    [positions, positionDecisions],
+  )
+  const acceptedCount = useMemo(
+    () => positions.filter((p) => p.position_type !== 'dienstleistung' && positionDecisions[p.id] === 'accepted').length,
+    [positions, positionDecisions],
+  )
+  const inquiryCount = useMemo(
+    () => positions.filter((p) => {
+      const decision = positionDecisions[p.id]
+      return p.position_type !== 'dienstleistung' && (decision === 'inquiry_pending' || pendingInquirySet.has(p.id) || inquiryPositionSet.has(p.id))
+    }).length,
+    [positions, positionDecisions, pendingInquirySet, inquiryPositionSet],
+  )
+  const openCount = Math.max(0, positions.length - assignedCount - serviceCount - rejectedCount)
+
   const filteredPositions = useMemo(() => {
     let filtered = positions
 
     if (filterMode !== 'alle') {
       filtered = filtered.filter((p) => {
-        const isSkipped = skippedPositionIds.has(p.id)
-        const hasSelection = (selectedArticleIds[p.id]?.length ?? 0) > 0
-        if (filterMode === 'dienstleistung') return isSkipped
-        if (isSkipped) return false
+        const isDL = p.position_type === 'dienstleistung'
+        const decision = positionDecisions[p.id]
+        const isRejected = decision === 'rejected'
+        const isAccepted = decision === 'accepted'
+        const isInquiry = decision === 'inquiry_pending' || pendingInquirySet.has(p.id) || inquiryPositionSet.has(p.id)
+        const hasSelection = (selectedArticleIds[p.id]?.length ?? 0) > 0 || (componentSelectionCounts[p.id] ?? 0) > 0
+        if (filterMode === 'dienstleistung') return isDL
+        if (isDL) return false
+        if (filterMode === 'abgelehnt') return isRejected
+        if (filterMode === 'bestaetigt') return isAccepted
+        if (filterMode === 'angefragt') return isInquiry && !isRejected
+        if (isRejected) return false
         if (filterMode === 'zugeordnet') return hasSelection
         if (filterMode === 'offen') return !hasSelection
         return true
@@ -64,18 +148,28 @@ export function PositionsList({
     }
 
     return filtered
-  }, [positions, searchTerm, filterMode, selectedArticleIds, skippedPositionIds])
+  }, [positions, searchTerm, filterMode, selectedArticleIds, componentSelectionCounts, positionDecisions, pendingInquirySet, inquiryPositionSet])
 
   const totalPages = Math.ceil(filteredPositions.length / pageSize)
   const safePage = Math.min(currentPage, Math.max(0, totalPages - 1))
   const pagedPositions = filteredPositions.slice(safePage * pageSize, (safePage + 1) * pageSize)
 
-  const assignedCount = useMemo(
-    () => positions.filter((p) => (selectedArticleIds[p.id]?.length ?? 0) > 0 && !skippedPositionIds.has(p.id)).length,
-    [positions, selectedArticleIds, skippedPositionIds],
-  )
-  const serviceCount = skippedPositionIds.size
-  const openCount = positions.length - assignedCount - serviceCount
+  // Use extended filter set when in assignment details mode
+  const standardFilters: FilterMode[] = ['alle', 'offen', 'dienstleistung']
+  const extendedFilters: FilterMode[] = ['alle', 'offen', 'angefragt', 'bestaetigt', 'abgelehnt', 'dienstleistung']
+  const filterSet = showAssignmentDetails ? extendedFilters : standardFilters
+
+  function filterLabel(mode: FilterMode): string {
+    switch (mode) {
+      case 'alle': return `Alle (${positions.length})`
+      case 'zugeordnet': return `Zugeordnet (${assignedCount})`
+      case 'offen': return `Offen (${openCount})`
+      case 'angefragt': return `Angefragt (${inquiryCount})`
+      case 'bestaetigt': return `Bestätigt (${acceptedCount})`
+      case 'abgelehnt': return `Abgelehnt (${rejectedCount})`
+      case 'dienstleistung': return `Dienstleistung (${serviceCount})`
+    }
+  }
 
   return (
     <section className="panel positions-panel">
@@ -104,6 +198,12 @@ export function PositionsList({
             <span className="summary-matched">{assignedCount} zugeordnet</span>
             <span className="summary-dot" />
             <span className="summary-open">{openCount} offen</span>
+            {rejectedCount > 0 && (
+              <>
+                <span className="summary-dot" />
+                <span className="summary-rejected">{rejectedCount} abgelehnt</span>
+              </>
+            )}
             {serviceCount > 0 && (
               <>
                 <span className="summary-dot" />
@@ -113,19 +213,13 @@ export function PositionsList({
           </div>
 
           <div className="filter-chips">
-            {(['alle', 'zugeordnet', 'offen', 'dienstleistung'] as const).map((mode) => (
+            {filterSet.map((mode) => (
               <button
                 key={mode}
                 className={`filter-chip ${filterMode === mode ? 'active' : ''}`}
                 onClick={() => { setFilterMode(mode); setCurrentPage(0) }}
               >
-                {mode === 'alle'
-                  ? `Alle (${positions.length})`
-                  : mode === 'zugeordnet'
-                    ? `Zugeordnet (${assignedCount})`
-                    : mode === 'offen'
-                      ? `Offen (${openCount})`
-                      : `Dienstleistung (${serviceCount})`}
+                {filterLabel(mode)}
               </button>
             ))}
           </div>
@@ -158,15 +252,31 @@ export function PositionsList({
           </div>
         )}
         {pagedPositions.map((position, index) => {
+          const posInquiries = inquiriesByPosition[position.id] ?? []
+          const inquiryStatus = posInquiries.some((inq) => inq.status === 'offen')
+            ? 'offen'
+            : posInquiries.some((inq) => inq.status === 'angefragt')
+              ? 'angefragt'
+              : posInquiries.some((inq) => inq.status === 'angebot_erhalten')
+                ? 'angebot_erhalten'
+                : null
           const isActive = position.id === activePositionId
-          const isSkipped = skippedPositionIds.has(position.id)
-          const hasSelection = (selectedArticleIds[position.id]?.length ?? 0) > 0
-          const hasSuggestions = (suggestionMap[position.id] ?? []).length > 0
+          const isDL = position.position_type === 'dienstleistung'
+          const componentSelectionCount = componentSelectionCounts[position.id] ?? 0
+          const componentSuggestionCount = componentSuggestionCounts[position.id] ?? 0
+          const decision = positionDecisions[position.id]
+          const isRejected = decision === 'rejected'
+          const isInquiryPending = decision === 'inquiry_pending'
+          const hasSelection = (selectedArticleIds[position.id]?.length ?? 0) > 0 || componentSelectionCount > 0
+          const hasSuggestions = (suggestionMap[position.id] ?? []).length > 0 || componentSuggestionCount > 0
+          const needsInquiryFollowUp = (pendingInquirySet.has(position.id) || isInquiryPending || inquiryStatus === 'offen' || inquiryStatus === 'angefragt') && !isRejected
           const category = position.parameters.product_category
           const showLoadClass = category ? LOAD_CLASS_CATEGORIES.has(category) : false
 
           let statusClass = 'status-open'
-          if (isSkipped) statusClass = 'status-service'
+          if (isDL) statusClass = 'status-service'
+          else if (isRejected) statusClass = 'status-rejected'
+          else if (needsInquiryFollowUp) statusClass = 'status-inquiry-open'
           else if (hasSelection) statusClass = 'status-matched'
           else if (!hasSuggestions && positions.length > 0) statusClass = 'status-none'
 
@@ -184,10 +294,18 @@ export function PositionsList({
                 <div className="position-head">
                   <span className="position-no">{position.ordnungszahl}</span>
                   <div className="position-badges">
-                    {category && <span className="badge badge-category">{category}</span>}
-                    {isSkipped ? (
-                      <span className="badge badge-service">
-                        {position.position_type === 'dienstleistung' ? 'Dienstleistung' : 'Ausgeschlossen'}
+                    {!showAssignmentDetails && category && <span className="badge badge-category">{category}</span>}
+                    {isDL ? (
+                      <span className="badge badge-service">Dienstleistung</span>
+                    ) : isRejected ? (
+                      <span className="badge badge-rejected">abgelehnt</span>
+                    ) : inquiryStatus ? (
+                      <span className={`badge ${inquiryStatus === 'angebot_erhalten' ? 'badge-ok' : 'badge-inquiry'}`}>
+                        {inquiryStatus === 'offen'
+                          ? 'Anfrage offen'
+                          : inquiryStatus === 'angefragt'
+                            ? 'Angefragt'
+                            : 'Angebot erhalten'}
                       </span>
                     ) : (
                       <span className={`badge ${hasSelection ? 'badge-ok' : hasSuggestions ? 'badge-warn' : 'badge-none'}`}>
@@ -197,11 +315,58 @@ export function PositionsList({
                   </div>
                 </div>
                 <p className="position-desc">{position.description}</p>
-                {hasSelection && (() => {
+                {showAssignmentDetails && hasSelection && (() => {
                   const primaryId = selectedArticleIds[position.id]?.[0]
                   const selectedArt = primaryId ? (suggestionMap[position.id] ?? []).find(
                     s => s.artikel_id === primaryId
                   ) : undefined
+                  if (!selectedArt && componentSelectionCount > 0) {
+                    return (
+                      <div className="position-assignment-detail">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                          <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                        <span className="pad-article-name">{componentSelectionCount} Artikel zugeordnet</span>
+                      </div>
+                    )
+                  }
+                  return selectedArt ? (
+                    <div className="position-assignment-detail">
+                      <div className="pad-main">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                          <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                        <span className="pad-article-name">{selectedArt.artikelname}</span>
+                        {selectedArt.hersteller && <span className="pad-manufacturer">{selectedArt.hersteller}</span>}
+                      </div>
+                      <div className="pad-price-row">
+                        <span className="pad-article-id">{selectedArt.artikel_id}</span>
+                        <span className="pad-price">EP: {formatPrice(selectedArt.price_net)}</span>
+                        <span className="pad-price">GP: {formatPrice(selectedArt.total_net)}</span>
+                      </div>
+                    </div>
+                  ) : null
+                })()}
+                {showAssignmentDetails && !hasSelection && !isDL && !isRejected && (
+                  <div className="position-assignment-detail pad-empty">
+                    Kein Artikel zugeordnet
+                  </div>
+                )}
+                {!showAssignmentDetails && hasSelection && (() => {
+                  const primaryId = selectedArticleIds[position.id]?.[0]
+                  const selectedArt = primaryId ? (suggestionMap[position.id] ?? []).find(
+                    s => s.artikel_id === primaryId
+                  ) : undefined
+                  if (!selectedArt && componentSelectionCount > 0) {
+                    return (
+                      <div className="position-selected-article">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                          <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                        <span>{componentSelectionCount} Artikel zugeordnet</span>
+                      </div>
+                    )
+                  }
                   return selectedArt ? (
                     <div className="position-selected-article">
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
@@ -211,6 +376,14 @@ export function PositionsList({
                     </div>
                   ) : null
                 })()}
+                {!showAssignmentDetails && !hasSelection && componentSuggestionCount > 0 && (
+                  <div className="position-selected-article">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                      <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    <span>{componentSuggestionCount} Artikel vorgeschlagen</span>
+                  </div>
+                )}
                 <div className="position-meta">
                   <span>Menge: {formatQty(position.quantity)} {position.unit ?? ''}</span>
                   {position.parameters.nominal_diameter_dn != null && (
@@ -233,24 +406,19 @@ export function PositionsList({
                   )}
                 </div>
               </button>
-              <button
-                className="skip-btn"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onToggleSkip(position.id)
-                }}
-                title={isSkipped ? 'Wieder einbeziehen' : 'Als Dienstleistung markieren'}
-              >
-                {isSkipped ? (
+              {showAssignmentDetails && onEditPosition && !isDL && (
+                <button
+                  type="button"
+                  className="position-edit-btn"
+                  title="Position in Zuordnungsansicht bearbeiten"
+                  onClick={(e) => { e.stopPropagation(); onEditPosition(position.id) }}
+                >
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                    <path d="M9 14l-4-4m0 0l4-4m-4 4h11a4 4 0 010 8h-1" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
                   </svg>
-                ) : (
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                    <path d="M6 18L18 6M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                  </svg>
-                )}
-              </button>
+                </button>
+              )}
             </div>
           )
         })}

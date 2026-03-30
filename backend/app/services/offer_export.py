@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 from datetime import datetime
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -314,10 +315,10 @@ def build_offer_pdf(lines: list[OfferLine], metadata: ExportOfferMetadata) -> by
     for line in lines:
         if line.is_additional:
             # Sub-row for additional article: indent with "+"
-            artikel_text = f"<font color='#475569'>+ {line.artikelname}</font>"
+            artikel_text = f"<font color='#475569'>+ {escape(line.artikelname)}</font>"
             if line.hersteller:
-                artikel_text += f"<br/><font size='6' color='#64748B'>{line.hersteller}</font>"
-            artikel_text += f"<br/><font size='6' color='#94A3B8'>{line.artikel_id}</font>"
+                artikel_text += f"<br/><font size='6' color='#64748B'>{escape(line.hersteller)}</font>"
+            artikel_text += f"<br/><font size='6' color='#94A3B8'>{escape(line.artikel_id)}</font>"
 
             table_data.append([
                 "",
@@ -328,14 +329,15 @@ def build_offer_pdf(lines: list[OfferLine], metadata: ExportOfferMetadata) -> by
                 _fmt_money(line.total_net),
             ])
         else:
-            desc_text = line.description[:120]
-            alt_suffix = " *" if line.is_alternative else ""
-            artikel_text = f"{line.artikelname}{alt_suffix}"
-            if line.hersteller:
-                artikel_text += f"<br/><font size='6' color='#64748B'>{line.hersteller}</font>"
-            artikel_text += f"<br/><font size='6' color='#94A3B8'>{line.artikel_id}</font>"
+            desc_text = escape(line.description or "")
             if line.supplier_open:
-                artikel_text += "<br/><font size='6' color='#CA8A04'>Lieferant offen</font>"
+                artikel_text = "<font color='#CA8A04'><b>Lieferant offen</b></font>"
+            else:
+                alt_suffix = " *" if line.is_alternative else ""
+                artikel_text = f"{escape(line.artikelname)}{alt_suffix}"
+                if line.hersteller:
+                    artikel_text += f"<br/><font size='6' color='#64748B'>{escape(line.hersteller)}</font>"
+                artikel_text += f"<br/><font size='6' color='#94A3B8'>{escape(line.artikel_id)}</font>"
 
             table_data.append([
                 line.ordnungszahl,

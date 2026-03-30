@@ -41,6 +41,7 @@ function formatPrice(value?: number | null): string {
 }
 
 export function ProductSearchModal({ isOpen, onClose, onSelect, initialCategory, initialDn }: Props) {
+  const PAGE_SIZE = 50
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState(initialCategory ?? '')
   const [dn, setDn] = useState(initialDn?.toString() ?? '')
@@ -50,8 +51,18 @@ export function ProductSearchModal({ isOpen, onClose, onSelect, initialCategory,
   const [angle, setAngle] = useState('')
   const [results, setResults] = useState<ProductSearchResult[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [hasMore, setHasMore] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined)
   const inputRef = useRef<HTMLInputElement>(null)
+  const currentParams = useRef({
+    q: '',
+    cat: '',
+    dn: '',
+    sn: '',
+    loadClass: '',
+    material: '',
+    angle: '',
+  })
 
   const activeFilters = CATEGORY_FILTERS[category] ?? []
 
@@ -66,6 +77,7 @@ export function ProductSearchModal({ isOpen, onClose, onSelect, initialCategory,
       setMaterial('')
       setAngle('')
       setResults([])
+      setHasMore(false)
       setTimeout(() => inputRef.current?.focus(), 100)
     }
   }, [isOpen, initialCategory, initialDn])
@@ -80,7 +92,8 @@ export function ProductSearchModal({ isOpen, onClose, onSelect, initialCategory,
 
   const doSearch = useCallback(async (params: {
     q: string; cat: string; dn: string; sn: string; loadClass: string; material: string; angle: string
-  }) => {
+  }, offset = 0) => {
+    const isAppend = offset > 0
     setIsLoading(true)
     try {
       const parsedDn = params.dn ? parseInt(params.dn, 10) : undefined
@@ -93,10 +106,14 @@ export function ProductSearchModal({ isOpen, onClose, onSelect, initialCategory,
         load_class: params.loadClass || undefined,
         material: params.material || undefined,
         angle: parsedAngle && !isNaN(parsedAngle) ? parsedAngle : undefined,
+        limit: PAGE_SIZE,
+        offset,
       })
-      setResults(data)
+      setResults(prev => isAppend ? [...prev, ...data.items] : data.items)
+      setHasMore(data.has_more)
     } catch {
-      setResults([])
+      if (!isAppend) setResults([])
+      setHasMore(false)
     } finally {
       setIsLoading(false)
     }
@@ -107,7 +124,9 @@ export function ProductSearchModal({ isOpen, onClose, onSelect, initialCategory,
     if (!isOpen) return
     if (debounceRef.current) clearTimeout(debounceRef.current)
     debounceRef.current = setTimeout(() => {
-      doSearch({ q: query, cat: category, dn, sn, loadClass, material, angle })
+      const params = { q: query, cat: category, dn, sn, loadClass, material, angle }
+      currentParams.current = params
+      doSearch(params)
     }, 300)
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
   }, [query, category, dn, sn, loadClass, material, angle, isOpen, doSearch])
@@ -236,6 +255,14 @@ export function ProductSearchModal({ isOpen, onClose, onSelect, initialCategory,
               </button>
             </div>
           ))}
+          {!isLoading && hasMore && (
+            <button
+              className="search-load-more"
+              onClick={() => doSearch(currentParams.current, results.length)}
+            >
+              Mehr Artikel laden
+            </button>
+          )}
         </div>
       </div>
     </div>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Component, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
@@ -56,6 +56,28 @@ function FlyToTender({ lat, lng }: { lat: number; lng: number }) {
   return null
 }
 
+class RadarMapBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props)
+    this.state = { hasError: false }
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="radar-map-fallback">
+          Kartenansicht konnte nicht geladen werden. Die Ausschreibungsliste steht weiterhin zur Verfügung.
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 export function TenderRadar() {
   const [tenders, setTenders] = useState<Tender[]>([])
   const [loading, setLoading] = useState(false)
@@ -64,15 +86,18 @@ export function TenderRadar() {
   const [selectedTender, setSelectedTender] = useState<Tender | null>(null)
   const [flyTo, setFlyTo] = useState<{ lat: number; lng: number } | null>(null)
   const [refreshMessage, setRefreshMessage] = useState<string | null>(null)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const markerRefs = useRef<Record<number, L.Marker>>({})
 
   const loadTenders = useCallback(async () => {
     setLoading(true)
+    setErrorMessage(null)
     try {
       const data = await fetchTenders()
       setTenders(data)
     } catch (e) {
       console.error('Failed to load tenders:', e)
+      setErrorMessage('Objektradar konnte nicht geladen werden. Bitte Seite neu laden oder später erneut versuchen.')
     } finally {
       setLoading(false)
     }
@@ -84,6 +109,7 @@ export function TenderRadar() {
 
   const handleRefresh = async () => {
     setRefreshing(true)
+    setErrorMessage(null)
     try {
       await refreshTenders()
       // Poll until done
@@ -93,6 +119,10 @@ export function TenderRadar() {
           setTimeout(poll, 2000)
         } else {
           setRefreshing(false)
+          if (status.last_result?.error) {
+            setErrorMessage(`Aktualisierung fehlgeschlagen: ${status.last_result.error}`)
+            return
+          }
           await loadTenders()
           if (status.last_result?.new != null) {
             setRefreshMessage(`${status.last_result.new} neue Ausschreibungen gefunden`)
@@ -103,6 +133,7 @@ export function TenderRadar() {
       setTimeout(poll, 2000)
     } catch (e) {
       console.error('Refresh failed:', e)
+      setErrorMessage('Aktualisierung des Objektradars fehlgeschlagen.')
       setRefreshing(false)
     }
   }
@@ -202,6 +233,12 @@ export function TenderRadar() {
         </button>
       </div>
 
+      {errorMessage && (
+        <div className="radar-error">
+          {errorMessage}
+        </div>
+      )}
+
       {/* Status filter tabs */}
       <div className="radar-filters">
         {(['alle', 'neu', 'relevant', 'irrelevant', 'analysiert'] as StatusFilter[]).map(s => (
@@ -220,47 +257,49 @@ export function TenderRadar() {
       <div className="radar-content">
         {/* Map */}
         <div className="radar-map">
-          <MapContainer
-            center={BONN_CENTER}
-            zoom={DEFAULT_ZOOM}
-            style={{ height: '100%', width: '100%', borderRadius: '8px' }}
-          >
-            <TileLayer
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-            />
-            {flyTo && <FlyToTender lat={flyTo.lat} lng={flyTo.lng} />}
-            {tendersWithCoords.map(t => (
-              <Marker
-                key={t.id}
-                position={[t.lat!, t.lng!]}
-                icon={getMarkerIcon(t.relevance_score)}
-                ref={(ref) => { if (ref) markerRefs.current[t.id] = ref }}
-                eventHandlers={{
-                  click: () => setSelectedTender(t),
-                }}
-              >
-                <Popup>
-                  <div className="radar-popup">
-                    <strong>{t.title}</strong>
-                    {t.auftraggeber && <p className="radar-popup-buyer">{t.auftraggeber}</p>}
-                    <p className="radar-popup-meta">
-                      {t.ort && <span>{t.ort}</span>}
-                      {t.submission_deadline && <span>Frist: {formatDate(t.submission_deadline)}</span>}
-                    </p>
-                    <div className="radar-popup-actions">
-                      {relevanceBadge(t.relevance_score)}
-                      {t.url && (
-                        <a href={t.url} target="_blank" rel="noopener noreferrer" className="radar-popup-link">
-                          Zur Ausschreibung
-                        </a>
-                      )}
+          <RadarMapBoundary>
+            <MapContainer
+              center={BONN_CENTER}
+              zoom={DEFAULT_ZOOM}
+              style={{ height: '100%', width: '100%', borderRadius: '8px' }}
+            >
+              <TileLayer
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              />
+              {flyTo && <FlyToTender lat={flyTo.lat} lng={flyTo.lng} />}
+              {tendersWithCoords.map(t => (
+                <Marker
+                  key={t.id}
+                  position={[t.lat!, t.lng!]}
+                  icon={getMarkerIcon(t.relevance_score)}
+                  ref={(ref) => { if (ref) markerRefs.current[t.id] = ref }}
+                  eventHandlers={{
+                    click: () => setSelectedTender(t),
+                  }}
+                >
+                  <Popup>
+                    <div className="radar-popup">
+                      <strong>{t.title}</strong>
+                      {t.auftraggeber && <p className="radar-popup-buyer">{t.auftraggeber}</p>}
+                      <p className="radar-popup-meta">
+                        {t.ort && <span>{t.ort}</span>}
+                        {t.submission_deadline && <span>Frist: {formatDate(t.submission_deadline)}</span>}
+                      </p>
+                      <div className="radar-popup-actions">
+                        {relevanceBadge(t.relevance_score)}
+                        {t.url && (
+                          <a href={t.url} target="_blank" rel="noopener noreferrer" className="radar-popup-link">
+                            Zur Ausschreibung
+                          </a>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                </Popup>
-              </Marker>
-            ))}
-          </MapContainer>
+                  </Popup>
+                </Marker>
+              ))}
+            </MapContainer>
+          </RadarMapBoundary>
         </div>
 
         {/* Table */}

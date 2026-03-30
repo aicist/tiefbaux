@@ -9,6 +9,18 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(256))
+    name: Mapped[str] = mapped_column(String(128))
+    role: Mapped[str] = mapped_column(String(16), default="mitarbeiter")  # 'admin' | 'mitarbeiter'
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Product(Base):
     __tablename__ = "products"
 
@@ -84,11 +96,26 @@ class LVProject(Base):
 
     # Feature 5: Stored article selections for duplicate reuse
     selections_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Persisted assignment workstate (selections, decisions, component selections)
+    workstate_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Feature 8: PDF storage
     pdf_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
+    # Project status: "neu", "offen", "anfrage_offen", "gerechnet"
+    status: Mapped[str] = mapped_column(String(16), default="neu", index=True)
+
+    # Offer PDF storage
+    offer_pdf_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+
+    # User tracking
+    assigned_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    last_editor_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    last_edited_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     positions = relationship("LVProjectPosition", back_populates="project", cascade="all, delete-orphan")
+    assigned_user = relationship("User", foreign_keys=[assigned_user_id])
+    last_editor = relationship("User", foreign_keys=[last_editor_id])
 
 
 class LVProjectPosition(Base):
@@ -151,6 +178,19 @@ class SupplierInquiry(Base):
     project = relationship("LVProject")
 
 
+class InboundEmailEvent(Base):
+    __tablename__ = "inbound_email_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    message_id: Mapped[str] = mapped_column(String(512), unique=True, index=True)
+    mailbox: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    sender: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    subject: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    processed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
 class Tender(Base):
     """Objektradar: Öffentliche Ausschreibungen aus Vergabe.NRW."""
     __tablename__ = "tenders"
@@ -172,6 +212,37 @@ class Tender(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     project_id: Mapped[Optional[int]] = mapped_column(ForeignKey("lv_projects.id"), nullable=True)
 
+    project = relationship("LVProject")
+
+
+class SupplierOffer(Base):
+    """Structured offer received from a supplier in response to an inquiry."""
+    __tablename__ = "supplier_offers"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    inquiry_id: Mapped[Optional[int]] = mapped_column(ForeignKey("supplier_inquiries.id"), nullable=True, index=True)
+    supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), index=True)
+    project_id: Mapped[Optional[int]] = mapped_column(ForeignKey("lv_projects.id"), nullable=True, index=True)
+    position_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ordnungszahl: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    article_name: Mapped[str] = mapped_column(String(512))
+    article_number: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    unit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    total_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    delivery_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    quantity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    unit: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    source: Mapped[str] = mapped_column(String(32), default="manual")  # manual | email_auto | pdf_import
+    status: Mapped[str] = mapped_column(String(32), default="neu")  # neu | zugeordnet | abgelehnt
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    supplier = relationship("Supplier")
+    inquiry = relationship("SupplierInquiry")
     project = relationship("LVProject")
 
 

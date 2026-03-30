@@ -8,11 +8,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ComponentRequirement(BaseModel):
     component_name: str
+    description: str | None = None
     product_category: str | None = None
     product_subcategory: str | None = None
     nominal_diameter_dn: int | None = None
+    secondary_nominal_diameter_dn: int | None = None
     quantity: int = 1
     material: str | None = None
+    system_family: str | None = None
+    load_class: str | None = None
+    dimensions: str | None = None
+    connection_type: str | None = None
+    installation_area: str | None = None
 
 
 class TechnicalParameters(BaseModel):
@@ -22,6 +29,7 @@ class TechnicalParameters(BaseModel):
     product_subcategory: str | None = None
     material: str | None = None
     nominal_diameter_dn: int | None = None
+    secondary_nominal_diameter_dn: int | None = None
     load_class: str | None = None
     norm: str | None = None
     dimensions: str | None = None
@@ -35,6 +43,10 @@ class TechnicalParameters(BaseModel):
     pipe_length_mm: int | None = None
     angle_deg: int | None = None
     application_area: str | None = None
+    system_family: str | None = None
+    connection_type: str | None = None
+    seal_type: str | None = None
+    compatible_systems: list[str] | None = None
     components: list[ComponentRequirement] | None = None
 
 
@@ -106,6 +118,9 @@ class ProductSuggestion(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     score_breakdown: list[ScoreBreakdown] = Field(default_factory=list)
     is_override: bool = False
+    is_supplier_offer: bool = False
+    supplier_offer_id: int | None = None
+    supplier_name: str | None = None
 
 
 class ComponentSuggestions(BaseModel):
@@ -124,6 +139,7 @@ class PositionSuggestions(BaseModel):
 
 class SuggestionsRequest(BaseModel):
     positions: list[LVPosition]
+    project_id: int | None = None
 
 
 class SuggestionsResponse(BaseModel):
@@ -133,12 +149,14 @@ class SuggestionsResponse(BaseModel):
 class ExportOfferRequest(BaseModel):
     positions: list[LVPosition]
     selected_article_ids: dict[str, list[str]]
+    assignment_keys_by_position: dict[str, list[str]] = Field(default_factory=dict)
     custom_unit_prices: dict[str, float] = Field(default_factory=dict)
     customer_name: str | None = None
     customer_address: str | None = None
     project_name: str | None = None
     alternative_flags: dict[str, bool] = Field(default_factory=dict)
     supplier_open_flags: dict[str, bool] = Field(default_factory=dict)
+    project_id: int | None = None
 
 
 class OfferLine(BaseModel):
@@ -192,6 +210,11 @@ class ProductSearchResult(BaseModel):
     werkstoff: str | None = None
 
 
+class ProductSearchResponse(BaseModel):
+    items: list[ProductSearchResult] = Field(default_factory=list)
+    has_more: bool = False
+
+
 class HealthResponse(BaseModel):
     status: str
 
@@ -209,6 +232,17 @@ class ProjectSummary(BaseModel):
     objekt_nr: str | None = None
     submission_date: str | None = None
     kunde_name: str | None = None
+    status: str = "neu"
+    offer_pdf_path: str | None = None
+    assigned_user_name: str | None = None
+    last_editor_name: str | None = None
+    last_edited_at: datetime | None = None
+
+
+class AssignmentUiState(BaseModel):
+    active_filter: Literal["alle", "zugeordnet", "offen", "dienstleistung"] = "alle"
+    current_position_id: str | None = None
+    is_finished: bool = False
 
 
 class ProjectDetailResponse(BaseModel):
@@ -216,11 +250,22 @@ class ProjectDetailResponse(BaseModel):
     positions: list[LVPosition]
     metadata: ProjectMetadata | None = None
     selections: dict[str, list[str]] | None = None
+    decisions: dict[str, Literal["accepted", "rejected", "inquiry_pending"]] | None = None
+    component_selections: dict[str, str] | None = None
+    ui_state: AssignmentUiState | None = None
 
 
 class SaveSelectionsRequest(BaseModel):
     project_id: int
     selected_article_ids: dict[str, list[str]]
+
+
+class SaveWorkstateRequest(BaseModel):
+    project_id: int
+    selected_article_ids: dict[str, list[str]] = Field(default_factory=dict)
+    decisions: dict[str, Literal["accepted", "rejected", "inquiry_pending"]] = Field(default_factory=dict)
+    component_selections: dict[str, str] = Field(default_factory=dict)
+    ui_state: AssignmentUiState | None = None
 
 
 class OverrideRequest(BaseModel):
@@ -279,6 +324,10 @@ class InquiryBatchCreateRequest(BaseModel):
 
 class BatchSendRequest(BaseModel):
     project_id: int
+    email_overrides: dict[int, dict[str, str]] = Field(default_factory=dict)
+    """Optional per-supplier overrides: {supplier_id: {subject: ..., body: ...}}"""
+    simulate_only: bool = False
+    """When true, do not send real emails; only persist the inquiry as sent."""
 
 
 class BatchSendResponse(BaseModel):
@@ -286,8 +335,19 @@ class BatchSendResponse(BaseModel):
     failed_count: int
 
 
+class BundledEmailPreview(BaseModel):
+    supplier_id: int
+    supplier_name: str
+    supplier_email: str
+    subject: str
+    body: str
+    inquiry_ids: list[int] = Field(default_factory=list)
+    positions: list[dict] = Field(default_factory=list)
+
+
 class InquiryResponse(BaseModel):
     id: int
+    supplier_id: int
     supplier_name: str
     supplier_email: str
     project_id: int | None = None
@@ -300,12 +360,68 @@ class InquiryResponse(BaseModel):
     sent_at: datetime | None = None
     email_subject: str | None = None
     email_body: str | None = None
+    notes: str | None = None
     created_at: datetime
 
 
 class InquiryStatusUpdate(BaseModel):
     status: str
     notes: str | None = None
+
+
+class InquiryContentUpdate(BaseModel):
+    email_subject: str | None = None
+    email_body: str | None = None
+    product_description: str | None = None
+
+
+class InquiryCleanupRequest(BaseModel):
+    project_id: int
+    position_id: str
+
+
+# --- Supplier Offers ---
+
+class SupplierOfferCreate(BaseModel):
+    inquiry_id: int | None = None
+    supplier_id: int
+    project_id: int | None = None
+    position_id: str | None = None
+    ordnungszahl: str | None = None
+    article_name: str
+    article_number: str | None = None
+    unit_price: float | None = None
+    total_price: float | None = None
+    delivery_days: int | None = None
+    quantity: float | None = None
+    unit: str | None = None
+    notes: str | None = None
+    source: str = "manual"
+
+
+class SupplierOfferResponse(BaseModel):
+    id: int
+    inquiry_id: int | None = None
+    supplier_id: int
+    supplier_name: str
+    project_id: int | None = None
+    position_id: str | None = None
+    ordnungszahl: str | None = None
+    article_name: str
+    article_number: str | None = None
+    unit_price: float | None = None
+    total_price: float | None = None
+    delivery_days: int | None = None
+    quantity: float | None = None
+    unit: str | None = None
+    notes: str | None = None
+    source: str
+    status: str
+    created_at: datetime
+
+
+class SupplierOfferStatusUpdate(BaseModel):
+    status: Literal["neu", "zugeordnet", "abgelehnt"]
 
 
 # --- Objektradar / Tenders ---
@@ -331,3 +447,37 @@ class TenderResponse(BaseModel):
 
 class TenderStatusUpdate(BaseModel):
     status: str
+
+
+# --- Auth & Users ---
+
+class UserResponse(BaseModel):
+    id: int
+    email: str
+    name: str
+    role: str
+    active: bool
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+    name: str
+    role: str = "mitarbeiter"
+
+class UserUpdate(BaseModel):
+    name: str | None = None
+    role: str | None = None
+    active: bool | None = None
+    password: str | None = None
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+class AssignProjectRequest(BaseModel):
+    user_id: int | None = None

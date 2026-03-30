@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { createInquiryBatch, fetchSuppliers } from '../api'
+import { createInquiryBatch, fetchInquiries, fetchSuppliers } from '../api'
 import type { LVPosition, Supplier } from '../types'
 
 type Props = {
@@ -15,6 +15,8 @@ type Props = {
 export function InquiryModal({ isOpen, onClose, position, projectName, projectId, productDescription, onSuccess }: Props) {
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
   const [selectedSupplierIds, setSelectedSupplierIds] = useState<Set<number>>(new Set())
+  const [alreadyInquiredSupplierIds, setAlreadyInquiredSupplierIds] = useState<Set<number>>(new Set())
+  const [editedDescription, setEditedDescription] = useState('')
   const [customMessage, setCustomMessage] = useState('')
   const [sending, setSending] = useState(false)
   const [sent, setSent] = useState(false)
@@ -26,15 +28,33 @@ export function InquiryModal({ isOpen, onClose, position, projectName, projectId
       setSent(false)
       setSentCount(0)
       setError(null)
+      setEditedDescription(productDescription || position.description)
       setCustomMessage('')
       setSelectedSupplierIds(new Set())
-      fetchSuppliers()
-        .then((s) => {
+      setAlreadyInquiredSupplierIds(new Set())
+
+      const loadSuppliers = fetchSuppliers()
+      const loadExisting = projectId
+        ? fetchInquiries(projectId)
+        : Promise.resolve([])
+
+      Promise.all([loadSuppliers, loadExisting])
+        .then(([s, existingInquiries]) => {
           setSuppliers(s)
-          // Auto-select suppliers matching position category
+
+          // Find suppliers that already have an open inquiry for this position
+          const alreadyInquired = new Set(
+            existingInquiries
+              .filter(inq => inq.position_id === position.id && inq.status === 'offen')
+              .map(inq => inq.supplier_id),
+          )
+          setAlreadyInquiredSupplierIds(alreadyInquired)
+
+          // Auto-select suppliers matching position category (excluding already inquired)
           const cat = position.parameters.product_category
           if (cat) {
             const matching = s.filter((sup) =>
+              !alreadyInquired.has(sup.id) &&
               sup.categories.some((c) => c.toLowerCase() === cat.toLowerCase()),
             )
             if (matching.length > 0) {
@@ -44,7 +64,7 @@ export function InquiryModal({ isOpen, onClose, position, projectName, projectId
         })
         .catch(() => setError('Lieferanten konnten nicht geladen werden'))
     }
-  }, [isOpen, position.parameters.product_category])
+  }, [isOpen, position.parameters.product_category, position.id, projectId])
 
   const toggleSupplier = (id: number) => {
     setSelectedSupplierIds((prev) => {
@@ -81,7 +101,7 @@ export function InquiryModal({ isOpen, onClose, position, projectName, projectId
         project_id: projectId,
         position_id: position.id,
         ordnungszahl: position.ordnungszahl,
-        product_description: productDescription || position.description,
+        product_description: editedDescription.trim() || position.description,
         technical_params: position.parameters,
         quantity: position.quantity,
         unit: position.unit,
@@ -138,8 +158,23 @@ export function InquiryModal({ isOpen, onClose, position, projectName, projectId
                 <label className="inquiry-label">Position</label>
                 <div className="inquiry-position-info">
                   <span className="inquiry-oz">{position.ordnungszahl}</span>
-                  <span>{position.description}</span>
+                  <span className="inquiry-position-desc">{position.description}</span>
                 </div>
+              </div>
+
+              {/* Editable product description */}
+              <div className="inquiry-section">
+                <label className="inquiry-label">Produktbeschreibung für Anfrage</label>
+                <textarea
+                  className="inquiry-textarea"
+                  value={editedDescription}
+                  onChange={(e) => setEditedDescription(e.target.value)}
+                  rows={3}
+                  placeholder="Beschreibung des angefragten Produkts..."
+                />
+                <span className="inquiry-hint">
+                  Kann frei angepasst werden — wird so an den Lieferanten gesendet.
+                </span>
               </div>
 
               {/* Technical params */}
@@ -174,18 +209,21 @@ export function InquiryModal({ isOpen, onClose, position, projectName, projectId
                           (c) => c.toLowerCase() === position.parameters.product_category!.toLowerCase(),
                         )
                       : false
+                    const alreadyInquired = alreadyInquiredSupplierIds.has(s.id)
                     const checked = selectedSupplierIds.has(s.id)
                     return (
-                      <label key={s.id} className={`inquiry-supplier-item ${checked ? 'checked' : ''} ${isMatch ? 'matching' : ''}`}>
+                      <label key={s.id} className={`inquiry-supplier-item ${checked ? 'checked' : ''} ${isMatch ? 'matching' : ''} ${alreadyInquired ? 'disabled' : ''}`}>
                         <input
                           type="checkbox"
                           checked={checked}
                           onChange={() => toggleSupplier(s.id)}
+                          disabled={alreadyInquired}
                         />
                         <div className="inquiry-supplier-detail">
                           <span className="inquiry-supplier-name">
                             {s.name}
-                            {isMatch && <span className="inquiry-match-badge">passend</span>}
+                            {alreadyInquired && <span className="inquiry-already-badge">bereits angefragt</span>}
+                            {!alreadyInquired && isMatch && <span className="inquiry-match-badge">passend</span>}
                           </span>
                           <span className="inquiry-supplier-email">{s.email}</span>
                         </div>

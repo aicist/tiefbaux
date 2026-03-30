@@ -1,11 +1,12 @@
 import { useState } from 'react'
-import type { LVPosition, PriceAdjustment, ProductSearchResult, ProductSuggestion, TechnicalParameters } from '../types'
+import type { ComponentSuggestions, LVPosition, PriceAdjustment, ProductSearchResult, ProductSuggestion, TechnicalParameters } from '../types'
 import { DinBadge } from './DinBadge'
 import { InquiryModal } from './InquiryModal'
 import { ParameterEditor } from './ParameterEditor'
 import { PriceAdjustmentControl } from './PriceAdjustmentControl'
 import { ProductSearchModal } from './ProductSearchModal'
 import { computeAdjustedTotal, computeAdjustedUnitPrice, isAdjustedPrice } from '../utils/pricing'
+import { primaryAssignmentKey } from '../utils/assignmentKeys'
 
 const PARAM_STYLES: Record<string, React.CSSProperties> = {
   match: { background: '#dcfce7', color: '#166534' },
@@ -31,9 +32,34 @@ function extractSnFromText(text: string): number | null {
   return match ? parseInt(match[1], 10) : null
 }
 
+function shouldShowNormBadge(_position: LVPosition | null, suggestion: ProductSuggestion): boolean {
+  if (!suggestion.norm) return false
+  return true
+}
+
+function filterSuggestionWarnings(warnings: string[]): string[] {
+  return warnings.filter((warning) => {
+    const lower = warning.toLowerCase()
+    return lower.includes('menge nicht erkannt')
+      || lower.includes('listenpreis ist 0')
+      || lower.includes('kein preis verfügbar')
+  })
+}
+
+function filterSuggestionReasons(reasons: string[]): string[] {
+  return reasons.filter((reason) => {
+    const lower = reason.toLowerCase()
+    if (lower.includes('norm abweichend')) return false
+    if (lower.includes('lager')) return false
+    if (/^(dn|od|anschluss-dn)\b/i.test(reason)) return false
+    return true
+  })
+}
+
 type Props = {
   activePosition: LVPosition | null
   suggestions: ProductSuggestion[]
+  componentSuggestions?: ComponentSuggestions[] | null
   selectedArticleIds: string[]
   priceAdjustment?: PriceAdjustment
   onSelectArticle: (positionId: string, artikelId: string) => void
@@ -69,6 +95,7 @@ function stockStatus(stock?: number | null): { label: string; className: string 
 export function SuggestionsPanel({
   activePosition,
   suggestions,
+  componentSuggestions = null,
   selectedArticleIds,
   priceAdjustment,
   onSelectArticle,
@@ -145,11 +172,49 @@ export function SuggestionsPanel({
           baseUnitPrice={selectedSuggestion.price_net}
           quantity={activePosition.quantity}
           currency={selectedSuggestion.currency}
-          onChange={(next) => onPriceAdjustmentChange(activePosition.id, next)}
+          onChange={(next) => onPriceAdjustmentChange(primaryAssignmentKey(activePosition.id), next)}
         />
       )}
 
-      {activePosition && visibleSuggestions.length === 0 && !isRefreshingSuggestions && (
+      {activePosition && componentSuggestions && componentSuggestions.length > 0 && (
+        <div className="multi-component-section">
+          <div className="multi-component-badge">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            Mehrkomponenten-Position ({componentSuggestions.length} Teile)
+          </div>
+          <div className="component-list">
+            {componentSuggestions.map((component) => {
+              const topSuggestion = component.suggestions[0]
+              return (
+                <div key={component.component_name} className="component-card">
+                  <div className="component-card-header">
+                    <span className="component-name">{component.component_name}</span>
+                    <span className="component-qty">{component.quantity}x</span>
+                  </div>
+                  {topSuggestion ? (
+                    <div className="component-match">
+                      <div className="component-match-info">
+                        <span className="component-article-name">{topSuggestion.artikelname}</span>
+                        <span className="component-article-meta">
+                          {topSuggestion.artikel_id}
+                          {topSuggestion.hersteller && <> &middot; {topSuggestion.hersteller}</>}
+                          {topSuggestion.dn != null && <> &middot; DN{topSuggestion.dn}</>}
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="component-no-match">Kein passender Artikel</div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {activePosition && visibleSuggestions.length === 0 && !componentSuggestions?.length && !isRefreshingSuggestions && (
         <div className="no-match-info">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
             <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.5" />
@@ -177,7 +242,9 @@ export function SuggestionsPanel({
             const isSelected = selectedArticleIds.includes(suggestion.artikel_id)
             const stock = stockStatus(suggestion.stock)
             const isBest = idx === 0 && !suggestion.is_manual && !suggestion.is_override
-            const hasWarnings = suggestion.warnings.length > 0
+            const filteredWarnings = filterSuggestionWarnings(suggestion.warnings)
+            const filteredReasons = filterSuggestionReasons(suggestion.reasons)
+            const hasWarnings = filteredWarnings.length > 0
             const isSelectedAdjusted = isSelected && isAdjustedPrice(suggestion.price_net, adjustedSelectedUnitPrice)
             const displayUnitPrice = isSelectedAdjusted ? adjustedSelectedUnitPrice : suggestion.price_net
             const displayTotal = isSelectedAdjusted ? adjustedSelectedTotal : suggestion.total_net
@@ -251,7 +318,7 @@ export function SuggestionsPanel({
                       label={suggestion.load_class}
                       status={!activePosition?.parameters.load_class ? 'neutral' : activePosition.parameters.load_class.toUpperCase() === suggestion.load_class.toUpperCase() ? 'match' : 'mismatch'}
                     />}
-                    {suggestion.norm && (
+                    {shouldShowNormBadge(activePosition, suggestion) && suggestion.norm && (
                       <span className={`param-badge param-${!activePosition?.parameters.norm ? 'neutral' : suggestion.norm.toLowerCase().includes(activePosition.parameters.norm.toLowerCase()) ? 'match' : 'mismatch'}`}
                         style={{
                           ...PARAM_STYLES[!activePosition?.parameters.norm ? 'neutral' : suggestion.norm.toLowerCase().includes(activePosition.parameters.norm.toLowerCase()) ? 'match' : 'mismatch'],
@@ -302,15 +369,15 @@ export function SuggestionsPanel({
 
                   {hasWarnings && (
                     <div className="suggestion-warnings">
-                      {suggestion.warnings.map((warning) => (
+                      {filteredWarnings.map((warning) => (
                         <span key={warning} className="warning-chip">{warning}</span>
                       ))}
                     </div>
                   )}
 
-                  {suggestion.reasons.length > 0 && !suggestion.is_manual && (
+                  {filteredReasons.length > 0 && (
                     <div className="reason-chips">
-                      {suggestion.reasons.map((reason) => {
+                      {filteredReasons.map((reason) => {
                         const isNegative = reason.includes('abweichend') || reason.includes('weicht ab') || reason.includes('unter ') || reason.includes('≠')
                         return (
                           <span key={reason} className={`reason-chip ${isNegative ? 'reason-negative' : ''}`}>{reason}</span>
