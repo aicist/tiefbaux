@@ -45,7 +45,8 @@ def _seed_admin(db):
     from .auth import hash_password
     from .models import User
 
-    existing = db.execute(select(User)).scalar_one_or_none()
+    # Avoid MultipleResultsFound when more than one user already exists.
+    existing = db.execute(select(User.id).limit(1)).scalar_one_or_none()
     if existing is None:
         admin = User(
             email="info@aicist.de",
