@@ -1066,6 +1066,17 @@ def _post_merge_sanity(params: TechnicalParameters, position: LVPosition) -> Tec
         updates["product_category"] = "Schachtbauteile"
         updates["product_subcategory"] = None
 
+    # 4c) "Leerrohr" positions sometimes specify a Kanalrohr-Norm (1401/1852/13476/14758)
+    #     — in that case the LV wants a standard PP/PVC-Kanalrohr used as Leerrohr,
+    #     not a dedicated Kabelschutzrohr. Reclassify so the matcher looks in Kanalrohre.
+    _KANAL_NORM_IDS_IN_TEXT = ("1401", "1852", "13476", "14758")
+    norm_text = (params.norm or "").lower()
+    if params.product_category == "Kabelschutz" and any(nid in norm_text for nid in _KANAL_NORM_IDS_IN_TEXT):
+        logger.info("Reclassifying %s from Kabelschutz→Kanalrohre (norm %s is a Kanalrohr norm)",
+                     position.ordnungszahl, params.norm)
+        updates["product_category"] = "Kanalrohre"
+        updates["product_subcategory"] = None
+
     # 5) DL positions should not carry DN (LLM often picks up irrelevant dimensions)
     if position.position_type == "dienstleistung" and params.nominal_diameter_dn is not None:
         logger.info("Clearing DN=%s for DL position %s", params.nominal_diameter_dn, position.ordnungszahl)

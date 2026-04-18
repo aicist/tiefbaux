@@ -1092,6 +1092,11 @@ def _category_match_score(category: str | None, subcategory: str | None, product
     elif category_norm and product_category in _RELATED_CATEGORIES.get(category_norm, set()):
         score += 15
         reasons.append(f"Kategorie verwandt ({product.kategorie})")
+    elif category_norm and category_norm == product_subcategory:
+        # LV sagt oft nur "Formstücke" als Kategorie, Katalog trägt es als
+        # Unterkategorie unter "Kanalrohre/Formstücke". Teilpunkte vergeben.
+        score += 15
+        reasons.append(f"Kategorie als Unterkategorie ({product.unterkategorie})")
 
     if subcategory_norm and subcategory_norm == product_subcategory:
         score += 18
@@ -1249,6 +1254,13 @@ def _norm_score(required_norm: str | None, product: Product) -> tuple[float, lis
     prod_base = _norm_base(product.norm_primaer or "")
     if req_base and prod_base and (req_base == prod_base or req_base in prod_base or prod_base in req_base):
         return 10.0, [f"Norm passt ({product.norm_primaer})"]
+
+    # Cross-family PP/PVC Kanalrohr norms (1401/1852/13476/14758/1437/12666) are
+    # all valid for Abwasserkanal — soften the penalty so Reinigungsrohre and
+    # andere Kanal-Formstücke aus einer Nachbar-Normfamilie noch ranken können.
+    kanal_ids = ("1401", "1852", "13476", "14758", "1437", "12666")
+    if any(n in required for n in kanal_ids) and any(n in product_norm for n in kanal_ids):
+        return -5.0, [f"Norm-Familie abweichend ({product.norm_primaer} ≠ {required_norm})"]
 
     # Norm explicitly specified but product has a different norm
     return -15.0, [f"Norm abweichend ({product.norm_primaer} ≠ {required_norm})"]
