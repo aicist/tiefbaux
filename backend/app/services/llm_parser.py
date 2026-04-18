@@ -452,14 +452,23 @@ def _call_gemini_parse_pdf(pdf_bytes: bytes) -> tuple[list[dict[str, Any]], dict
         "generationConfig": {
             "temperature": 0,
             "responseMimeType": "application/json",
+            "maxOutputTokens": 65536,
         },
     }
 
     data = _post_gemini(payload, timeout=180)
     try:
-        content = data["candidates"][0]["content"]["parts"][0]["text"]
+        candidate = data["candidates"][0]
+        content = candidate["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
         raise InterpretationError(f"Unexpected Gemini response format: {data}") from exc
+
+    finish_reason = candidate.get("finishReason")
+    if finish_reason and finish_reason not in ("STOP", "MODEL_STOP"):
+        raise InterpretationError(
+            f"Gemini output incomplete (finishReason={finish_reason}). "
+            "The PDF is likely too large for a single-shot parse; consider splitting it."
+        )
 
     try:
         normalized = _normalize_json_content(content)
