@@ -22,6 +22,10 @@ def _resolve_database_url(raw: str) -> str:
         relative = raw.replace("sqlite:///./", "")
         absolute = _BACKEND_DIR / relative
         return f"sqlite:///{absolute}"
+    if raw.startswith("postgres://"):
+        raw = "postgresql://" + raw[len("postgres://"):]
+    if raw.startswith("postgresql://"):
+        return "postgresql+psycopg://" + raw[len("postgresql://"):]
     return raw
 
 

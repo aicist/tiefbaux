@@ -12,7 +12,13 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_engine(settings.database_url, future=True)
+_is_postgres = settings.database_url.startswith("postgresql")
+engine = create_engine(
+    settings.database_url,
+    future=True,
+    pool_pre_ping=_is_postgres,
+    pool_recycle=300 if _is_postgres else -1,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 
