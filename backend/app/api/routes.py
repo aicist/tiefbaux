@@ -363,7 +363,6 @@ def _enrich_from_pdf(positions: list[LVPosition], pdf_bytes: bytes | None) -> li
         return positions
     try:
         from ..services.llm_parser import (
-            _derive_description_from_raw_text,
             _extract_raw_texts_from_pages,
             _map_oz_to_anchor_top,
             _map_oz_to_page,
@@ -374,10 +373,12 @@ def _enrich_from_pdf(positions: list[LVPosition], pdf_bytes: bytes | None) -> li
         raw_texts = _extract_raw_texts_from_pages(pdf_pages, oz_list)
         oz_pages = _map_oz_to_page(pdf_bytes, oz_list)
         oz_tops = _map_oz_to_anchor_top(pdf_bytes, oz_list)
+        # Description is rebuilt later via finalize_position_descriptions; do
+        # not override it here — the caller runs _upgrade_position_params which
+        # calls finalize_position_descriptions itself.
         return [
             p.model_copy(update={
                 **({"raw_text": raw_texts[p.ordnungszahl]} if p.ordnungszahl in raw_texts else {}),
-                **({"description": _derive_description_from_raw_text(raw_texts[p.ordnungszahl], p.description)} if p.ordnungszahl in raw_texts else {}),
                 **({"source_page": oz_pages[p.ordnungszahl]} if p.ordnungszahl in oz_pages else {}),
                 **({"source_y": oz_tops[p.ordnungszahl]} if p.ordnungszahl in oz_tops else {}),
             })

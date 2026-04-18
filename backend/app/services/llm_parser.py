@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 import pdfplumber
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 from ..config import settings
 from ..schemas import LVPosition, ProjectMetadata, TechnicalParameters
@@ -198,7 +198,13 @@ SYSTEM_INSTRUCTION = (
     "'compatible_systems'. "
     "KONKRETES GEGENBEISPIEL: 'Rueckstauklappe/Rohrklappe, Norm: DIN EN 13564 Typ 0, "
     "Anschluss fuer PVC-KG-Rohr nach DIN 19534' → norm='DIN EN 13564 Typ 0' (NICHT DIN 19534!), "
-    "compatible_systems=['PVC-KG'].)\n"
+    "compatible_systems=['PVC-KG']. "
+    "ZUSAETZLICHES VERBOT: DIN EN ISO 9969 ist die PRUEFMETHODE fuer Ringsteifigkeit "
+    "(stiffness_class_sn). Sie ist NIE eine Produkt-Norm und darf NIEMALS in 'norm' erscheinen, "
+    "auch wenn das LV formuliert 'Nenn-Ringsteifigkeit SN 4 DIN EN ISO 9969'. Wenn das LV als "
+    "einzige Referenz 'allgemeine bauaufsichtliche Zulassung' (abZ) oder 'DIBt-Zulassung' "
+    "nennt und keine Produkt-DIN, setze norm=null und packe 'mit allgemeiner bauaufsichtlicher "
+    "Zulassung' in features.)\n"
     "- stiffness_class_sn: integer | null (Ringsteifigkeitsklasse, z.B. 4, 8, 16 bei SN4, SN8, SN16)\n"
     "- dimensions: string | null (Abmessungen wie '300/500 mm', '500x500 mm', '12/15 x 25 x 50 cm' — "
     "insbesondere bei Aufsaetzen, Rosten, Rahmen, Rinnen, Bordsteinen. "
@@ -393,6 +399,21 @@ SYSTEM_INSTRUCTION = (
     "Fuer Dienstleistungs-Positionen setze alle technischen Parameter auf null.\n"
     "Ueberspringe Ueberschriften (z.B. '1.5 Entwaesserungsleitungen'), Vorbemerkungen, "
     "Hinweise und nicht-bepreisbare Zeilen (ohne Menge/Einheit).\n\n"
+    "KRITISCH - KEINE Positionen weglassen: Jede Zeile mit einer Ordnungszahl "
+    "(z.B. '10.0001', '1.5.3') und einer Menge + Einheit ist eine Position und MUSS "
+    "im Output erscheinen. Das gilt besonders fuer:\n"
+    "- Stundenlohnarbeiten / Stundenloehne (Vorarbeiter, Facharbeiter, Hilfsarbeiter, "
+    "Maschinist) mit Einheit 'Std.', 'Std', 'h' → position_type='dienstleistung';\n"
+    "- Geraete-/Maschinenvorhaltung (Radlader, Bagger, Minibagger, Kettenbagger, LKW, "
+    "Kompressor, Hilti, Grubenpumpe, Verdichter etc.) auf Anweisung/Einsatz mit "
+    "Einheit 'Std.', 'Std', 'h', 'Stück' oder 'Tag' → position_type='dienstleistung';\n"
+    "- Zulagen/An- und Abfahrten, die als eigene OZ mit Menge + Einheit stehen;\n"
+    "- EVENTUALPOSITION / 'nur EP' / Bedarfsposition: Diese sind bepreisbar und MUESSEN "
+    "aufgenommen werden — das Wort 'EVENTUALPOSITION' vor oder ueber der OZ-Zeile ist "
+    "KEIN Grund zum Ueberspringen. Das 'nur EP' hinter der Menge heisst nur 'Einheits"
+    "preis ohne Gesamtpreis', aendert aber nichts an der Bepreisbarkeit der Position.\n"
+    "Wenn ein ganzes Kapitel nur aus Stundenloehnen und Geraeten besteht (z.B. "
+    "'10 Stundenloehne und Geraete'), bearbeite JEDE darin enthaltene OZ einzeln.\n\n"
     "WICHTIG - Seitenumbrueche: Positionen koennen ueber Seitenumbrueche gehen. "
     "Wenn eine Seite mit 'Leistungsbeschreibung auf voranstehender Seite' oder "
     "aehnlichem Fortsetzungstext beginnt, gefolgt von einer Menge und Einheit, "
@@ -464,6 +485,15 @@ def _call_gemini_parse_pdf(pdf_bytes: bytes) -> tuple[list[dict[str, Any]], dict
         raise InterpretationError(f"Unexpected Gemini response format: {data}") from exc
 
     finish_reason = candidate.get("finishReason")
+    usage = data.get("usageMetadata") or {}
+    logger.info(
+        "Gemini parse: finishReason=%s, promptTokens=%s, candidateTokens=%s, totalTokens=%s, responseBytes=%d",
+        finish_reason,
+        usage.get("promptTokenCount"),
+        usage.get("candidatesTokenCount"),
+        usage.get("totalTokenCount"),
+        len(content or ""),
+    )
     if finish_reason and finish_reason not in ("STOP", "MODEL_STOP"):
         raise InterpretationError(
             f"Gemini output incomplete (finishReason={finish_reason}). "
@@ -830,6 +860,233 @@ def _is_service_by_heuristic(pos: LVPosition) -> bool:
     return False
 
 
+_BACKFILL_QTY_RE = re.compile(
+    r"^\s*([\d.,]+)\s+"
+    r"(Std\.?|StD|h|m2|m²|m3|m³|m|lfm|lfdm|lfd\.m|Stück|Stk|Stueck|Stueck\.|St\.?|"
+    r"kg|to|t|Psch|psch|Pausch|Wo|mWo|cbm|Tag)\b",
+    re.IGNORECASE,
+)
+
+_BACKFILL_SKIP_LINE_RE = re.compile(
+    r"^\s*(EVENTUALPOSITION|Übertrag|Uebertrag|POS\.|LEISTUNGSBESCHREIBUNG|"
+    r"Architekt|Objekt\s*:|Bauherr\s*:|Seite\s+\d+|"
+    r"LEISTUNGSVERZEICHNIS|NETTOANGEBOTSSUMME|BRUTTOANGEBOTSSUMME|MEHRWERTSTEUER)",
+    re.IGNORECASE,
+)
+
+
+def _extract_qty_unit_from_block(block: str) -> tuple[float | None, str | None]:
+    """Parse the first quantity+unit line out of a raw OZ block."""
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = _BACKFILL_QTY_RE.match(stripped)
+        if not m:
+            continue
+        qty_raw = m.group(1).replace(".", "").replace(",", ".")
+        try:
+            qty = float(qty_raw)
+        except ValueError:
+            qty = None
+        unit = m.group(2)
+        unit = unit.rstrip(".")
+        unit_map = {"std": "Std", "h": "h", "stk": "Stück", "stueck": "Stück", "st": "Stück"}
+        unit = unit_map.get(unit.lower(), unit)
+        return qty, unit
+    return None, None
+
+
+def _backfill_missing_oz_positions(
+    pdf_bytes: bytes,
+    positions: list[LVPosition],
+    next_index_start: int,
+) -> list[LVPosition]:
+    """Detect OZs present in the PDF but missing from the LLM output and add stubs.
+
+    Serves as a safety net when the LLM skips chapters (observed with Stundenlohn/
+    EVENTUALPOSITION blocks). Backfilled positions default to dienstleistung with
+    quantity/unit parsed from the raw text; description is the first non-empty
+    content line after the OZ.
+    """
+    try:
+        pages = extract_raw_text_pages(pdf_bytes)
+    except Exception as exc:
+        logger.warning("Backfill raw-text extraction failed: %s", exc)
+        return positions
+    if not pages:
+        return positions
+
+    full_text = "\n".join(pages)
+    lines = full_text.split("\n")
+    all_oz_lines: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        m = _OZ_LINE_RE.match(line)
+        if m and "." in m.group(1):
+            all_oz_lines.append((i, m.group(1)))
+
+    parsed_oz = {p.ordnungszahl for p in positions}
+    missing: list[tuple[int, str, int]] = []
+    for idx, (start_line, oz) in enumerate(all_oz_lines):
+        if oz in parsed_oz:
+            continue
+        end_line = all_oz_lines[idx + 1][0] if idx + 1 < len(all_oz_lines) else min(start_line + 40, len(lines))
+        missing.append((start_line, oz, end_line))
+
+    if not missing:
+        return positions
+
+    oz_pages: dict[str, int] = {}
+    try:
+        oz_pages = _map_oz_to_page(pdf_bytes, [oz for _, oz, _ in missing])
+    except Exception as exc:
+        logger.warning("Backfill page mapping failed: %s", exc)
+
+    backfilled: list[LVPosition] = []
+    next_idx = next_index_start
+    for start_line, oz, end_line in missing:
+        block_lines: list[str] = []
+        first_line = lines[start_line]
+        title = _OZ_LINE_RE.sub("", first_line, count=1).strip()
+        if title and not _BACKFILL_QTY_RE.match(title):
+            block_lines.append(title)
+        for j in range(start_line + 1, end_line):
+            raw_line = lines[j]
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if _BACKFILL_SKIP_LINE_RE.match(stripped):
+                continue
+            # Keep quantity lines even when they trail dots/underscores (LV template).
+            has_qty = bool(_BACKFILL_QTY_RE.match(stripped))
+            if not has_qty and ("________" in stripped or ".................." in stripped):
+                continue
+            block_lines.append(raw_line.rstrip())
+
+        block_text = "\n".join(block_lines).strip()
+        if not block_text:
+            continue
+
+        qty, unit = _extract_qty_unit_from_block(block_text)
+        if qty is None or unit is None:
+            logger.info("Backfill skipped %s — no quantity/unit in block", oz)
+            continue
+
+        description_lines = [
+            ln for ln in block_lines
+            if not _BACKFILL_QTY_RE.match(ln.strip())
+        ]
+        description = " ".join(ln.strip() for ln in description_lines).strip()
+        if not description:
+            description = title or f"Position {oz}"
+        description = description[:800]
+
+        logger.info(
+            "Backfilling missing OZ %s: qty=%s %s, desc='%s'",
+            oz, qty, unit, description[:60],
+        )
+
+        position = LVPosition(
+            id=f"pos-{next_idx}",
+            ordnungszahl=oz,
+            description=description,
+            raw_text=block_text,
+            quantity=qty,
+            unit=unit,
+            billable=False,
+            position_type="dienstleistung",
+            parameters=TechnicalParameters(quantity=qty, unit=unit),
+            source_page=oz_pages.get(oz),
+        )
+        backfilled.append(position)
+        next_idx += 1
+
+    combined = list(positions) + backfilled
+
+    if backfilled:
+        logger.info("Backfilled %d missing OZ positions (were dropped by LLM)", len(backfilled))
+
+    def _sort_key(p: LVPosition) -> list[int]:
+        try:
+            return [int(x) for x in p.ordnungszahl.split(".")]
+        except ValueError:
+            return [999]
+
+    combined.sort(key=_sort_key)
+    return combined
+
+
+def _backfill_missing_qty_unit(
+    pdf_bytes: bytes,
+    positions: list[LVPosition],
+) -> list[LVPosition]:
+    """For positions where the LLM returned an OZ but left quantity or unit blank,
+    attempt to recover them from the full PDF text block (which may span pages).
+
+    Triggered by LV layouts where the quantity line sits after a page break /
+    'Übertrag' / header boilerplate and the LLM didn't reattach it.
+    """
+    needing = {p.ordnungszahl for p in positions if p.quantity is None or not p.unit}
+    if not needing:
+        return positions
+
+    try:
+        pages = extract_raw_text_pages(pdf_bytes)
+    except Exception as exc:
+        logger.warning("Qty backfill raw-text extraction failed: %s", exc)
+        return positions
+    if not pages:
+        return positions
+
+    full_text = "\n".join(pages)
+    lines = full_text.split("\n")
+    all_oz_lines: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        m = _OZ_LINE_RE.match(line)
+        if m and "." in m.group(1):
+            all_oz_lines.append((i, m.group(1)))
+
+    blocks: dict[str, str] = {}
+    for idx, (start_line, oz) in enumerate(all_oz_lines):
+        if oz not in needing:
+            continue
+        end_line = all_oz_lines[idx + 1][0] if idx + 1 < len(all_oz_lines) else min(start_line + 60, len(lines))
+        blocks[oz] = "\n".join(lines[start_line:end_line])
+
+    if not blocks:
+        return positions
+
+    updated: list[LVPosition] = []
+    fixed_count = 0
+    for pos in positions:
+        if pos.ordnungszahl not in blocks:
+            updated.append(pos)
+            continue
+        qty, unit = _extract_qty_unit_from_block(blocks[pos.ordnungszahl])
+        new_qty = pos.quantity if pos.quantity is not None else qty
+        new_unit = pos.unit if pos.unit else unit
+        if new_qty == pos.quantity and new_unit == pos.unit:
+            updated.append(pos)
+            continue
+        logger.info(
+            "Qty backfill %s: qty %s→%s, unit %s→%s",
+            pos.ordnungszahl, pos.quantity, new_qty, pos.unit, new_unit,
+        )
+        updated.append(pos.model_copy(update={
+            "quantity": new_qty,
+            "unit": new_unit,
+            "parameters": pos.parameters.model_copy(update={
+                "quantity": new_qty,
+                "unit": new_unit,
+            }),
+        }))
+        fixed_count += 1
+
+    if fixed_count:
+        logger.info("Qty backfill completed %d positions", fixed_count)
+    return updated
+
+
 def _post_process_positions(positions: list[LVPosition]) -> list[LVPosition]:
     """Thin post-processing over LLM output.
 
@@ -869,6 +1126,10 @@ def _post_process_positions(positions: list[LVPosition]) -> list[LVPosition]:
                 ),
             })
 
+        # Safety net: flip DL→material when text clearly indicates product supply
+        # (e.g. "Verbundsteinpflaster liefern und verlegen" without "bauseits").
+        pos = _maybe_reclassify_as_material(pos)
+
         if pos.position_type == "dienstleistung":
             validated.append(pos)
             continue
@@ -884,7 +1145,6 @@ def _post_process_positions(positions: list[LVPosition]) -> list[LVPosition]:
                 "parameters": pos.parameters.model_copy(update={"product_category": None}),
             })
 
-        pos = _maybe_reclassify_as_material(pos)
         cleaned = _post_merge_sanity(pos.parameters, pos)
         validated.append(pos.model_copy(update={"parameters": cleaned}))
     return validated
@@ -1144,9 +1404,9 @@ def _derive_description_from_raw_text(raw_text: str, fallback: str | None = None
             break
 
     if details:
-        return f"{title}, {', '.join(details)}"[:200]
+        return f"{title}, {', '.join(details)}"[:800]
 
-    return title[:200]
+    return title[:800]
 
 
 def _is_bad_display_description(value: str | None) -> bool:
@@ -1351,7 +1611,7 @@ def finalize_position_descriptions(positions: list[LVPosition]) -> list[LVPositi
     previous_material_description: str | None = None
     for position in positions:
         if position.position_type == "dienstleistung":
-            description = _derive_description_from_raw_text(position.raw_text, position.description)
+            description = _build_dl_description(position)
         else:
             description = _build_display_description(position, previous_material_description)
         updated = position.model_copy(update={"description": description})
@@ -1359,6 +1619,37 @@ def finalize_position_descriptions(positions: list[LVPosition]) -> list[LVPositi
         if updated.position_type == "material":
             previous_material_description = description
     return finalized
+
+
+def _build_dl_description(position: LVPosition) -> str:
+    """Build the display description for a service position.
+
+    Prefers the LLM-provided description (which reliably contains the position
+    heading like "Kabelschutzrohr R plus Typ 450, 110 mm"), and appends any
+    installation/bauseits/qualification notes derived from raw_text that the
+    LLM may have dropped.
+    """
+    llm_desc = re.sub(r"\s+", " ", (position.description or "")).strip(" ,;")
+    derived = _derive_description_from_raw_text(position.raw_text, position.description)
+
+    if llm_desc and not _is_bad_display_description(llm_desc):
+        base = llm_desc
+    else:
+        base = derived
+
+    if base and derived and derived != base:
+        base_lower = base.lower()
+        for chunk in derived.split(","):
+            token = chunk.strip(" .")
+            if not token:
+                continue
+            if token.lower() in base_lower:
+                continue
+            if len(base) + len(token) + 2 > 800:
+                break
+            base = f"{base}, {token}"
+            base_lower = base.lower()
+    return (base or derived)[:800]
 
 
 def _extract_raw_texts_from_pages(
@@ -1430,12 +1721,89 @@ def _extract_raw_texts_from_pages(
     return result
 
 
-def parse_lv_with_llm(pdf_bytes: bytes) -> tuple[list[LVPosition], ProjectMetadata]:
-    """Parse an LV PDF using a single Gemini call with direct PDF upload.
+PAGE_BATCH_THRESHOLD = 12
+PAGE_BATCH_SIZE = 8
+PAGE_BATCH_OVERLAP = 1
 
-    Returns (positions, metadata) tuple.
+
+def _split_pdf_into_page_batches(
+    pdf_bytes: bytes, *, chunk_size: int = PAGE_BATCH_SIZE, overlap: int = PAGE_BATCH_OVERLAP
+) -> list[bytes]:
+    """Split a PDF into page-range batches with the given overlap between consecutive batches."""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    total = len(reader.pages)
+    if total <= chunk_size:
+        return [pdf_bytes]
+
+    batches: list[bytes] = []
+    start = 0
+    step = max(1, chunk_size - overlap)
+    while start < total:
+        end = min(start + chunk_size, total)
+        writer = PdfWriter()
+        for i in range(start, end):
+            writer.add_page(reader.pages[i])
+        buf = io.BytesIO()
+        writer.write(buf)
+        batches.append(buf.getvalue())
+        if end == total:
+            break
+        start += step
+    return batches
+
+
+def _parse_pdf_with_batching(pdf_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run Gemini on page-batches, merge positions (dedupe by OZ), keep first-chunk metadata."""
+    batches = _split_pdf_into_page_batches(pdf_bytes)
+    if len(batches) == 1:
+        return _call_gemini_parse_pdf(pdf_bytes)
+
+    logger.info("Batching parse: %d chunks of up to %d pages (overlap %d)",
+                len(batches), PAGE_BATCH_SIZE, PAGE_BATCH_OVERLAP)
+
+    merged_positions: list[dict[str, Any]] = []
+    seen_oz: set[str] = set()
+    merged_metadata: dict[str, Any] = {}
+
+    for idx, chunk in enumerate(batches, start=1):
+        try:
+            raw_positions, raw_metadata = _call_gemini_parse_pdf(chunk)
+        except InterpretationError as exc:
+            logger.warning("Batch %d/%d failed: %s", idx, len(batches), exc)
+            continue
+
+        if idx == 1 and raw_metadata:
+            merged_metadata = {k: v for k, v in raw_metadata.items() if v}
+
+        new_count = 0
+        for raw in raw_positions:
+            oz = (raw.get("ordnungszahl") or "").strip()
+            if not oz or oz in seen_oz:
+                continue
+            seen_oz.add(oz)
+            merged_positions.append(raw)
+            new_count += 1
+        logger.info("Batch %d/%d: %d positions returned, %d new after dedupe",
+                    idx, len(batches), len(raw_positions), new_count)
+
+    return merged_positions, merged_metadata
+
+
+def parse_lv_with_llm(pdf_bytes: bytes) -> tuple[list[LVPosition], ProjectMetadata]:
+    """Parse an LV PDF via Gemini with direct PDF upload.
+
+    Uses a single call for small PDFs (<=12 pages) and page-batched calls for
+    larger PDFs, to work around flash-lite's lazy-completion on long inputs.
     """
-    raw_positions, raw_metadata = _call_gemini_parse_pdf(pdf_bytes)
+    try:
+        page_count = len(PdfReader(io.BytesIO(pdf_bytes)).pages)
+    except Exception:
+        page_count = 0
+
+    if page_count and page_count > PAGE_BATCH_THRESHOLD:
+        raw_positions, raw_metadata = _parse_pdf_with_batching(pdf_bytes)
+    else:
+        raw_positions, raw_metadata = _call_gemini_parse_pdf(pdf_bytes)
 
     if not raw_positions:
         raise InterpretationError("LLM returned no positions")
@@ -1484,6 +1852,10 @@ def parse_lv_with_llm(pdf_bytes: bytes) -> tuple[list[LVPosition], ProjectMetada
         for p in positions
     ]
 
+    # Safety net: backfill OZs that exist in the PDF but were dropped by the LLM.
+    positions = _backfill_missing_oz_positions(pdf_bytes, positions, next_index_start=len(positions) + 1)
+    positions = _backfill_missing_qty_unit(pdf_bytes, positions)
+
     # Thin post-processing: reclassification safety net + normalization.
     positions = _post_process_positions(positions)
     positions = finalize_position_descriptions(positions)
@@ -1494,7 +1866,5 @@ def parse_lv_with_llm(pdf_bytes: bytes) -> tuple[list[LVPosition], ProjectMetada
         sum(1 for p in positions if p.position_type == "material"),
         sum(1 for p in positions if p.position_type == "dienstleistung"),
     )
-
-    return positions, metadata
 
     return positions, metadata
