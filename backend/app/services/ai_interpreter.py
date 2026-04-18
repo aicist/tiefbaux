@@ -119,15 +119,11 @@ CATEGORY_KEYWORDS: list[tuple[str, str, str | None]] = [
 ]
 
 MATERIAL_KEYWORDS = {
-    "pp": "PP",
-    "pvc": "PVC-U",
     "pvc-u": "PVC-U",
     "polymerbeton": "Polymerbeton",
     "stahlbeton": "Stahlbeton",
     "beton": "Beton",
     "gusseisen": "Gusseisen",
-    "guss": "Gusseisen",
-    "hdpe": "HDPE",
     "polyethylen": "HDPE",
     "pe-hd": "HDPE",
     "pe 100": "HDPE",
@@ -137,9 +133,14 @@ MATERIAL_KEYWORDS = {
 }
 
 # Keywords that need word-boundary matching (short strings prone to substring false-positives)
+# NOTE: "pp" must be word-boundary-only — otherwise substrings like "klappe"/"schuppen"/"stoppel"
+# would incorrectly set material to PP.
+# NOTE: "pvc"/"guss" also lenient — substrings like "gussanschluss" should not force Gusseisen.
 _MATERIAL_REGEX_KEYWORDS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bpe\b", re.IGNORECASE), "HDPE"),
     (re.compile(r"\bpp\b", re.IGNORECASE), "PP"),
+    (re.compile(r"\bpvc\b", re.IGNORECASE), "PVC-U"),
+    (re.compile(r"\bguss\b", re.IGNORECASE), "Gusseisen"),
 ]
 
 LOAD_CLASSES = ("A15", "B125", "C250", "D400", "D900", "E600", "F900")
@@ -316,9 +317,30 @@ def _to_string_list(value: Any) -> list[str] | None:
     return None
 
 
+_SYSTEM_FAMILY_COMPAT_MARKERS = (
+    "anschluss für",
+    "anschluss fuer",
+    "zum anschluss",
+    "passend für",
+    "passend fuer",
+    "anschluss an",
+    "kompatibel",
+    "für pvc-kg",
+    "fuer pvc-kg",
+    "pvc-kg-rohr",
+    "pe-hd-rohr",
+)
+
+
 def _infer_system_family(text: str) -> str | None:
+    # When the text frames the match as a compatibility/connection statement,
+    # the keyword describes what the product connects TO, not what the product IS.
+    is_compat_context = any(marker in text for marker in _SYSTEM_FAMILY_COMPAT_MARKERS)
     for keyword, system_family in SYSTEM_FAMILY_KEYWORDS:
-        if keyword in text:
+        # Use word boundaries to avoid "kg-rohr" matching inside "pvc-kg-rohr"
+        if re.search(rf"(?<![a-z0-9-]){re.escape(keyword)}(?![a-z0-9-])", text):
+            if is_compat_context and system_family in {"KG PVC-U", "KG 2000", "HDPE"}:
+                continue
             return system_family
     return None
 
@@ -913,87 +935,6 @@ def _infer_with_heuristics(position: LVPosition) -> TechnicalParameters:
     )
 
 
-def _call_gemini_batch(positions: list[LVPosition]) -> list[dict[str, Any]]:
-    if not settings.gemini_api_key:
-        raise InterpretationError("GEMINI_API_KEY not configured")
-
-    instruction = (
-        "Du bist ein erfahrener Tiefbau-Fachberater bei einem Baustoffhaendler. "
-        "Analysiere die folgenden LV-Positionen und extrahiere pro Position die technischen Parameter. "
-        "Gib ein JSON-Array zurueck mit einem Objekt pro Position (gleiche Reihenfolge). "
-        "Jedes Objekt hat diese Keys: "
-        "product_category, product_subcategory, material, nominal_diameter_dn (Integer oder null), "
-        "secondary_nominal_diameter_dn (Integer oder null, zweite Nennweite bei Formstücken/Anschlüssen), "
-        "load_class, norm, stiffness_class_sn (Integer oder null, z.B. 4/8/16 fuer SN4/SN8/SN16), "
-        "dimensions, color, reference_product, installation_area, sortiment_relevant, "
-        "pipe_length_mm (Integer oder null, Baulaenge/Rohrlaenge in mm), "
-        "angle_deg (Integer oder null, Winkel bei Formstücken z.B. 15/30/45/67/87 Grad), "
-        "application_area (String oder null, z.B. Trinkwasser/Gas/Abwasser/Regenwasser), "
-        "system_family (String oder null, z.B. AWADUKT HPP, Wavin Tegra, Wavin X-Stream, KG PVC-U), "
-        "connection_type (String oder null, z.B. Steckmuffe, Flansch, Spitzende), "
-        "seal_type (String oder null, z.B. Lippendichtung, Gleitringdichtung), "
-        "compatible_systems (Array oder null, z.B. ['KG','HT'] oder ['PVC-KG','PE-HD']). "
-        "Verwende fuer product_category nur: Kanalrohre, Schachtabdeckungen, Schachtbauteile, "
-        "Formstücke, Straßenentwässerung, Rinnen, Dichtungen & Zubehör. "
-        "Setze null wenn ein Wert nicht erkennbar ist.\n\n"
-        "sortiment_relevant (boolean): Ist diese Position ein Produkt das ein Tiefbau-/Baustoffhaendler "
-        "fuehren wuerde (Rohre, Schaechte, Formstücke, Abdeckungen, Rinnen, Dichtungen, Geotextilien, "
-        "Druckrohre, Kabelschutzrohre)? "
-        "NICHT relevant sind: Stuetzmauern, Fundamente, Bordsteine, Pflaster, Asphalt, Oberboden, "
-        "Rasen, Poller, Blockstufen, Zaeune, Beleuchtung, Sand/Kies/Schotter (als Schuettgut), "
-        "Hydrantenarmaturen, Hausanschlussgarnituren, reine Einbau-/Montagearbeiten. "
-        "Setze true wenn es ein Handelsprodukt ist, false wenn nicht.\n\n"
-        "components (Array oder null): Falls die Position eine mehrteilige Baugruppe beschreibt "
-        "(z.B. 'Schacht komplett mit Unterteil, 3 Ringen, Konus und Abdeckung' oder "
-        "'Strassenablauf komplett mit Aufsatz, Rost und Anschlussrohr'), "
-        "zerlege in Einzelkomponenten. Jede Komponente ist ein Objekt mit: "
-        "component_name (z.B. 'Schachtunterteil'), description, product_category, product_subcategory, "
-        "nominal_diameter_dn (Integer oder null), secondary_nominal_diameter_dn (Integer oder null), "
-        "quantity (Integer, z.B. 3 fuer '3 Ringe'), material (String oder null), "
-        "system_family (String oder null), load_class, dimensions, connection_type, installation_area. "
-        "Setze null wenn es eine einfache Einzelprodukt-Position ist."
-    )
-
-    pos_texts = []
-    for i, pos in enumerate(positions):
-        pos_texts.append(
-            f"Position {i+1}:\n"
-            f"  Ordnungszahl: {pos.ordnungszahl}\n"
-            f"  Beschreibung: {pos.description}\n"
-            f"  Rohtext: {pos.raw_text}\n"
-            f"  Menge: {pos.quantity} {pos.unit or ''}"
-        )
-
-    prompt = "Analysiere diese LV-Positionen und gib nur ein JSON-Array zurueck:\n\n" + "\n\n".join(pos_texts)
-
-    payload = {
-        "system_instruction": {"parts": [{"text": instruction}]},
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "responseMimeType": "application/json",
-        },
-    }
-
-    data = _post_gemini(payload, timeout=45)
-    try:
-        content = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise InterpretationError(f"Unexpected Gemini response format: {data}") from exc
-
-    normalized = _normalize_json_array(content)
-
-    try:
-        parsed: list[dict[str, Any]] = json.loads(normalized)
-    except json.JSONDecodeError as exc:
-        raise InterpretationError(f"Invalid JSON returned by model: {exc}") from exc
-
-    if not isinstance(parsed, list):
-        raise InterpretationError("Gemini did not return a JSON array")
-
-    return parsed
-
-
 # Materials that never carry an SN (stiffness) class
 _NO_SN_MATERIALS = {"Beton", "Stahlbeton", "Polymerbeton", "Gusseisen", "Stahl"}
 
@@ -1122,6 +1063,77 @@ def _post_merge_sanity(params: TechnicalParameters, position: LVPosition) -> Tec
         logger.info("Normalizing load_class '%s'→'%s' for %s", params.load_class, normalized_load, position.ordnungszahl)
         updates["load_class"] = normalized_load
 
+    # 5b) Articles that never have a DN (Mauerscheiben, Bordsteine, Stützwände, Pflaster, Blockstufen).
+    #     Heuristic DN_RE often matches DN from Nebenpositionen (e.g. Drainagerohr DN 100 as
+    #     Unterposition of a Mauerscheibe) and wrongly assigns it to the main article.
+    _NO_DN_ARTICLE_TYPES = (
+        "mauerscheibe", "mauerscheiben-ecke", "stützwand", "stuetzwand",
+        "winkelstein", "l-stein", "bordstein", "randstein", "pflasterstein",
+        "blockstufe", "rinnenstein", "absenkstein", "kurvenstein",
+    )
+    article_lower = (params.article_type or "").lower()
+    if article_lower and any(t in article_lower for t in _NO_DN_ARTICLE_TYPES):
+        if params.nominal_diameter_dn is not None:
+            logger.info("Clearing DN=%s for %s (article type has no nominal diameter)",
+                         params.nominal_diameter_dn, position.ordnungszahl)
+            updates["nominal_diameter_dn"] = None
+        if params.secondary_nominal_diameter_dn is not None:
+            updates["secondary_nominal_diameter_dn"] = None
+
+    # 5c) secondary_dn must differ from primary_dn.
+    #     Also catch DA/DN confusion: PVC DN 100 ↔ DA 110, DN 150 ↔ DA 160, DN 200 ↔ DA 200
+    #     (common rounded DA values just above the DN). When the LV gives a single
+    #     connection size that matches primary_dn via the DA mapping, secondary stays null.
+    current_primary = updates.get("nominal_diameter_dn", params.nominal_diameter_dn)
+    current_secondary = updates.get("secondary_nominal_diameter_dn", params.secondary_nominal_diameter_dn)
+    if current_primary is not None and current_secondary is not None:
+        _DN_TO_DA = {100: 110, 125: 140, 150: 160, 200: 200, 250: 250, 300: 315}
+        same_size = (
+            current_primary == current_secondary
+            or _DN_TO_DA.get(current_primary) == current_secondary
+        )
+        if same_size:
+            logger.info("Clearing secondary DN=%s (same size as primary DN=%s) for %s",
+                         current_secondary, current_primary, position.ordnungszahl)
+            updates["secondary_nominal_diameter_dn"] = None
+
+    # 5d) Prefer explicit "Norm: X" label over first regex match.
+    #     Avoids picking up compatibility-system norms like "DIN 19534" for Rohrklappen.
+    _NORM_LABEL_RE = re.compile(
+        r"norm[:\s]+((?:DIN|EN|ISO)(?:\s+EN)?(?:\s+ISO)?[\s]*\d+(?:-\d+)?(?:\s+Typ\s+\d+)?)",
+        re.IGNORECASE,
+    )
+    norm_label_match = _NORM_LABEL_RE.search(position.raw_text or "")
+    if norm_label_match:
+        preferred_norm = norm_label_match.group(1).strip()
+        # Normalize whitespace
+        preferred_norm = re.sub(r"\s+", " ", preferred_norm)
+        if params.norm != preferred_norm:
+            logger.info("Overriding norm %r → %r for %s (explicit 'Norm:' label)",
+                         params.norm, preferred_norm, position.ordnungszahl)
+            updates["norm"] = preferred_norm
+
+    # 5d-2) Preserve llm_parser's literal material output when it was generic ("Kunststoff").
+    #       The llm_parser prompt explicitly forbids inferring PP/PVC/PE from generic "Kunststoff";
+    #       heuristic keyword matching and the second Gemini batch would otherwise overwrite it.
+    original_material = (position.parameters.material or "").strip()
+    if original_material.lower() == "kunststoff" and params.material in {"PP", "PVC-U", "HDPE", "PE 100", "PE 100 RC"}:
+        logger.info("Reverting material %s → 'Kunststoff' for %s (llm_parser chose literal Kunststoff)",
+                     params.material, position.ordnungszahl)
+        updates["material"] = "Kunststoff"
+
+    # 5e) Clear system_family when the text only mentions it in a compatibility context
+    #     (e.g. Rohrklappe "zum Anschluss für PVC-KG-Rohr" — KG is not the family of the
+    #     Klappe itself, it's what the Klappe connects to).
+    if params.system_family:
+        lower_raw = (position.raw_text or "").lower()
+        klappe_article = article_lower and ("klappe" in article_lower or "schieber" in article_lower)
+        compat_marker_present = any(m in lower_raw for m in _SYSTEM_FAMILY_COMPAT_MARKERS)
+        if klappe_article and compat_marker_present and params.system_family in {"KG PVC-U", "KG 2000", "HDPE"}:
+            logger.info("Clearing system_family=%s for %s (compatibility-only reference)",
+                         params.system_family, position.ordnungszahl)
+            updates["system_family"] = None
+
     # 6) Clear fabricated pipe materials — LLM sometimes assigns PP/PVC-U/HDPE to non-pipe products
     #    like Noppenschutzbahn, Auslaufstücke, etc. where the PDF doesn't specify material
     _PIPE_MATERIALS = {"PP", "PVC-U", "HDPE", "PE 100", "PE 100 RC"}
@@ -1240,84 +1252,17 @@ def _maybe_reclassify_as_material(position: LVPosition) -> LVPosition:
 
 
 def enrich_positions_with_parameters(positions: list[LVPosition]) -> list[LVPosition]:
+    """Heuristic-only enrichment for the regex-fallback path.
+
+    The main LLM path parses the PDF directly and does not use this function.
+    Here we only run heuristic inference + sanity normalization as a best-effort
+    when Gemini is unavailable or returned no positions.
+    """
     enriched: list[LVPosition] = []
-
-    # First pass: heuristic enrichment for all positions
-    heuristic_results: list[TechnicalParameters] = []
     for position in positions:
-        heuristic_results.append(_infer_with_heuristics(position))
-
-    # Second pass: batch Gemini enrichment
-    if settings.gemini_api_key:
-        batch_size = 15
-        ai_results: list[dict[str, Any] | None] = [None] * len(positions)
-
-        for batch_start in range(0, len(positions), batch_size):
-            batch = positions[batch_start : batch_start + batch_size]
-            try:
-                batch_results = _call_gemini_batch(batch)
-                for i, result in enumerate(batch_results):
-                    if batch_start + i < len(positions):
-                        ai_results[batch_start + i] = result
-            except InterpretationError as exc:
-                logger.warning("Gemini batch %d-%d failed, using heuristics: %s", batch_start, batch_start + len(batch), exc)
-            except Exception as exc:
-                logger.warning("Gemini batch %d-%d errored, using heuristics: %s", batch_start, batch_start + len(batch), exc)
-
-        # Merge AI results with heuristics
-        for i, position in enumerate(positions):
-            interpreted = heuristic_results[i]
-            ai_data = ai_results[i]
-            if ai_data and isinstance(ai_data, dict):
-                try:
-                    # Extract components before filtering for TechnicalParameters fields
-                    raw_components = ai_data.pop("components", None)
-                    if "compatible_systems" in ai_data:
-                        ai_data["compatible_systems"] = _to_string_list(ai_data.get("compatible_systems"))
-                    ai_data.setdefault("quantity", position.quantity)
-                    ai_data.setdefault("unit", position.unit)
-                    ai_params = TechnicalParameters(**{k: v for k, v in ai_data.items() if k in TechnicalParameters.model_fields})
-                    merged = interpreted.model_dump()
-                    merged.update({k: v for k, v in ai_params.model_dump().items() if v not in (None, "")})
-
-                    # Parse components from Gemini
-                    if raw_components and isinstance(raw_components, list) and len(raw_components) > 1:
-                        components = []
-                        for comp in raw_components:
-                            if isinstance(comp, dict) and comp.get("component_name"):
-                                components.append(ComponentRequirement(
-                                    component_name=comp["component_name"],
-                                    description=comp.get("description"),
-                                    product_category=comp.get("product_category"),
-                                    product_subcategory=comp.get("product_subcategory"),
-                                    nominal_diameter_dn=comp.get("nominal_diameter_dn"),
-                                    secondary_nominal_diameter_dn=comp.get("secondary_nominal_diameter_dn"),
-                                    quantity=comp.get("quantity", 1),
-                                    material=comp.get("material"),
-                                    system_family=comp.get("system_family"),
-                                    load_class=comp.get("load_class"),
-                                    dimensions=comp.get("dimensions"),
-                                    connection_type=comp.get("connection_type"),
-                                    installation_area=comp.get("installation_area"),
-                                ))
-                        if len(components) > 1:
-                            merged["components"] = components
-
-                    interpreted = TechnicalParameters(**merged)
-                except Exception as exc:
-                    logger.warning("Failed to merge AI params for position %s: %s", position.ordnungszahl, exc)
-
-            # Reclassify before sanity checks (sanity needs correct position_type)
-            position = _maybe_reclassify_as_dl(position, interpreted)
-            position = _maybe_reclassify_as_material(position)
-            interpreted = _post_merge_sanity(interpreted, position)
-            enriched.append(position.model_copy(update={"parameters": interpreted}))
-    else:
-        for i, position in enumerate(positions):
-            interpreted = heuristic_results[i]
-            position = _maybe_reclassify_as_dl(position, interpreted)
-            position = _maybe_reclassify_as_material(position)
-            interpreted = _post_merge_sanity(interpreted, position)
-            enriched.append(position.model_copy(update={"parameters": interpreted}))
-
+        interpreted = _infer_with_heuristics(position)
+        position = _maybe_reclassify_as_dl(position, interpreted)
+        position = _maybe_reclassify_as_material(position)
+        interpreted = _post_merge_sanity(interpreted, position)
+        enriched.append(position.model_copy(update={"parameters": interpreted}))
     return enriched

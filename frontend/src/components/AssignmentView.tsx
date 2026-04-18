@@ -7,7 +7,8 @@ import { InquiryModal } from './InquiryModal'
 import { PriceAdjustmentControl } from './PriceAdjustmentControl'
 import { ProductSearchModal } from './ProductSearchModal'
 import { computeAdjustedTotal, computeAdjustedUnitPrice, isAdjustedPrice } from '../utils/pricing'
-import { additionalAssignmentKey, componentAssignmentKey, componentSelectionKey, primaryAssignmentKey } from '../utils/assignmentKeys'
+import { additionalAssignmentKey, componentAssignmentKey, primaryAssignmentKey } from '../utils/assignmentKeys'
+import { buildEmbeddedPdfViewerUrl } from '../utils/pdfViewer'
 
 const LOAD_CLASS_CATEGORIES = new Set(['Schachtabdeckungen', 'Straßenentwässerung'])
 
@@ -35,34 +36,18 @@ function normalizeOZForSearch(oz: string): string {
 }
 
 function buildOriginalPdfViewerUrl(projectId: number, position: LVPosition): string {
-  const base = getProjectPdfUrl(projectId)
   const page = Math.max(1, position.source_page ?? 1)
-  const hash = new URLSearchParams()
-  hash.set('page', String(page))
-  hash.set('zoom', 'page-width')
-  hash.set('pagemode', 'none')
-  hash.set('toolbar', '0')
-  hash.set('navpanes', '0')
-  hash.set('scrollbar', '0')
-
-  // Improve jump precision inside the page: search first by OZ, then by short description prefix.
-  const searchTerms: string[] = []
-  if (position.ordnungszahl) {
-    searchTerms.push(position.ordnungszahl)
-    searchTerms.push(normalizeOZForSearch(position.ordnungszahl))
-  }
-  const descPrefix = position.description
-    .replace(/\s+/g, ' ')
-    .trim()
-    .split(/[,.–-]/)[0]
-    .trim()
-  if (descPrefix.length > 0) {
-    searchTerms.push(descPrefix.slice(0, 64))
-  }
-  const search = searchTerms.find((term) => term.length > 0)
-  if (search) hash.set('search', search)
-
-  return `${base}#${hash.toString()}`
+  const top = Math.max(0, Math.trunc(position.source_y ?? 0))
+  const normalizedOz = normalizeOZForSearch(position.ordnungszahl)
+  const basePdfUrl = getProjectPdfUrl(projectId)
+  // Ensure the iframe reloads on every OZ change.
+  const joiner = basePdfUrl.includes('?') ? '&' : '?'
+  const cacheBusted = `${basePdfUrl}${joiner}oz_anchor=${encodeURIComponent(normalizedOz)}`
+  return buildEmbeddedPdfViewerUrl(cacheBusted, {
+    page,
+    top,
+    search: normalizedOz,
+  })
 }
 
 function shouldShowNormBadge(_position: LVPosition, suggestion: ProductSuggestion): boolean {
@@ -245,7 +230,6 @@ export function AssignmentView({
   onToggleSupplierOpen,
   positionSuggestions = [],
   componentSelections = {},
-  onComponentSelect,
   onComponentManualSelect,
   persistedUiState,
   onUiStateChange,
@@ -357,7 +341,6 @@ export function AssignmentView({
   const [showRejectConfirm, setShowRejectConfirm] = useState(false)
   const [showOriginalPdf, setShowOriginalPdf] = useState(false)
   const [carouselIndex, setCarouselIndex] = useState(0)
-  const [componentCarouselIndices, setComponentCarouselIndices] = useState<Record<string, number>>({})
   const [swipeDir, setSwipeDir] = useState<'up' | 'down' | null>(null)
   const [pendingJumpPositionId, setPendingJumpPositionId] = useState<string | null>(null)
   const progressHydratedRef = useRef(false)
@@ -459,27 +442,6 @@ export function AssignmentView({
       return () => clearTimeout(timer)
     }
   }, [slideDirection])
-
-  useEffect(() => {
-    if (!currentPosition) return
-    const entry = positionSuggestions.find((ps) => ps.position_id === currentPosition.id)
-    const components = entry?.component_suggestions ?? []
-    if (components.length === 0) return
-    setComponentCarouselIndices((prev) => {
-      const next = { ...prev }
-      for (const component of components) {
-        const selectionKey = componentSelectionKey(currentPosition.id, component.component_name)
-        const selectedId = componentSelections[selectionKey]
-        const selectedIndex = component.suggestions.findIndex((s) => s.artikel_id === selectedId)
-        if (selectedIndex >= 0) {
-          next[selectionKey] = selectedIndex
-        } else if (next[selectionKey] == null) {
-          next[selectionKey] = 0
-        }
-      }
-      return next
-    })
-  }, [currentPosition, positionSuggestions, componentSelections])
 
   const goNext = useCallback(() => {
     setSlideDirection('left')
@@ -988,12 +950,9 @@ export function AssignmentView({
   const pricingReferenceSuggestion = currentSuggestions.find((s) => s.artikel_id === currentSelectedArticles[0]) ?? topSuggestion
   const progressPercent = totalCount > 0 ? (currentIndex / totalCount) * 100 : 0
 
-  // Multi-component: check if current position has component_suggestions
-  const currentPosSuggestionEntry = currentPosition
-    ? positionSuggestions.find(ps => ps.position_id === currentPosition.id)
+  const originalPdfUrl = projectId && currentPosition
+    ? buildOriginalPdfViewerUrl(projectId, currentPosition)
     : null
-  const currentComponentSuggestions = currentPosSuggestionEntry?.component_suggestions ?? null
-  const isMultiComponent = currentComponentSuggestions != null && currentComponentSuggestions.length > 1
 
   return (
     <div className="assignment-view">
@@ -1078,27 +1037,153 @@ export function AssignmentView({
                 </span>
               )}
             </div>
-            <div className="position-desc">{currentPosition.description}</div>
-            <div className="position-params">
-              {currentPosition.parameters.nominal_diameter_dn && (
-                <span className="param-chip">DN {currentPosition.parameters.nominal_diameter_dn}</span>
-              )}
-              {currentPosition.parameters.material && (
-                <span className="param-chip">{currentPosition.parameters.material}</span>
-              )}
-              {currentPosition.parameters.product_category && (
-                <span className="param-chip">{currentPosition.parameters.product_category}</span>
-              )}
-              {currentPosition.parameters.load_class && (
-                <span className="param-chip">{currentPosition.parameters.load_class}</span>
-              )}
-              {currentPosition.parameters.stiffness_class_sn && (
-                <span className="param-chip">SN{currentPosition.parameters.stiffness_class_sn}</span>
-              )}
-              {currentPosition.quantity != null && currentPosition.unit && (
-                <span className="param-chip quantity">{currentPosition.quantity} {currentPosition.unit}</span>
-              )}
-            </div>
+            {(() => {
+              const p = currentPosition.parameters
+              const isService = currentPosition.position_type === 'dienstleistung'
+              const productTitle =
+                p.article_type
+                || p.product_category
+                || (isService ? 'Dienstleistung' : null)
+              const productSubtitle = p.product_subcategory || null
+              const specRows: Array<{ label: string; value: string }> = []
+              const push = (label: string, value: unknown, fmt?: (v: string) => string) => {
+                if (value === null || value === undefined || value === '' || value === false) return
+                const s = fmt ? fmt(String(value)) : String(value)
+                if (!s.trim()) return
+                specRows.push({ label, value: s })
+              }
+              push('Nennweite', p.nominal_diameter_dn, v => `DN ${v}`)
+              push('Zweite Nennweite', p.secondary_nominal_diameter_dn, v => `DN ${v}`)
+              push('Material', p.material)
+              push('Druckfestigkeit', p.compressive_strength)
+              push('Expositionsklasse', p.exposition_class)
+              push('Lastklasse', p.load_class)
+              push('Ringsteifigkeit', p.stiffness_class_sn, v => `SN ${v}`)
+              push('Norm', p.norm)
+              push('Dimensionen', p.dimensions)
+              push('Farbe', p.color)
+              push('Einbauort', p.installation_area)
+              push('Anwendungsbereich', p.application_area)
+              push('Systemfamilie', p.system_family)
+              push('Verbindung', p.connection_type)
+              push('Dichtung', p.seal_type)
+              push('Rohrlänge', p.pipe_length_mm, v => `${v} mm`)
+              push('Winkel', p.angle_deg, v => `${v}°`)
+              if (p.reference_product) {
+                const ref = p.reference_product.trim()
+                const isPassendZu = /^(passend\s+zu|formgleich|abgestimmt|gem\.|gemäß|gemaess)/i.test(ref)
+                const isZb = /^(z\.?\s*b\.|wie\b|typ\b)/i.test(ref)
+                const label = isPassendZu ? 'Passend zu' : (isZb ? 'Richtprodukt' : 'Referenzprodukt')
+                const stripPrefix = isPassendZu
+                  ? /^(passend\s+zu|formgleich|abgestimmt|gem\.|gemäß|gemaess)\s*/i
+                  : (isZb ? /^(z\.?\s*b\.|wie|typ)\s*/i : null)
+                const value = stripPrefix ? ref.replace(stripPrefix, '').trim() : ref
+                push(label, value || ref)
+              }
+              if (p.compatible_systems && p.compatible_systems.length > 0) {
+                push('Kompatibel mit', p.compatible_systems.join(', '))
+              }
+              if (p.variants && p.variants.length > 0) {
+                push('Zulässige Varianten', p.variants.join(' / '))
+              }
+              const featureItems = p.features?.filter(f => f && f.trim()) ?? []
+              const specItems = p.additional_specs?.filter(s => s && s.trim()) ?? []
+              const installationItems = (p.installation_notes ?? '')
+                .split(/[\n;]+/)
+                .map(s => s.trim())
+                .filter(Boolean)
+              const isMaterial = currentPosition.position_type === 'material'
+              const hasIdentifyingSpec =
+                p.nominal_diameter_dn != null
+                || !!p.material
+                || !!p.dimensions
+                || !!p.load_class
+                || !!p.norm
+                || !!p.compressive_strength
+                || !!p.exposition_class
+                || (p.features?.length ?? 0) > 0
+                || (p.variants?.length ?? 0) > 0
+                || (p.additional_specs?.length ?? 0) > 0
+              const showIncompleteWarning = isMaterial && !hasIdentifyingSpec
+              return (
+                <>
+                  <div className="position-head-row">
+                    {productTitle && (
+                      <div className="position-product-title">
+                        <div className="position-product-main">{productTitle}</div>
+                        {productSubtitle && (
+                          <div className="position-product-sub">{productSubtitle}</div>
+                        )}
+                      </div>
+                    )}
+                    {currentPosition.quantity != null && currentPosition.unit && (
+                      <div className="position-quantity-pill">
+                        <span className="qty-value">{currentPosition.quantity.toLocaleString('de-DE')}</span>
+                        <span className="qty-unit">{currentPosition.unit}</span>
+                      </div>
+                    )}
+                  </div>
+                  {showIncompleteWarning && (
+                    <div className="position-incomplete-warning" role="alert">
+                      ⚠ Parsing unvollständig — Original-LV pruefen (Material, DN, Dimensionen oder Klasse fehlen).
+                    </div>
+                  )}
+                  {specRows.length > 0 && (
+                    <div className="position-section">
+                      <div className="position-section-label">Technische Daten</div>
+                      <dl className="position-spec-grid">
+                        {specRows.map(row => (
+                          <div key={row.label} className="position-spec-row">
+                            <dt>{row.label}</dt>
+                            <dd>{row.value}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                    </div>
+                  )}
+                  {(specItems.length > 0 || featureItems.length > 0 || installationItems.length > 0) && (
+                    <div className="position-sections-row">
+                      {specItems.length > 0 && (
+                        <div className="position-section position-section--col">
+                          <div className="position-section-label">Gütewerte &amp; Prüfanforderungen</div>
+                          <ul className="position-features-list">
+                            {specItems.map((f, i) => (
+                              <li key={i}>{f}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {featureItems.length > 0 && (
+                        <div className="position-section position-section--col">
+                          <div className="position-section-label">Ausführung</div>
+                          <ul className="position-features-list">
+                            {featureItems.map((f, i) => (
+                              <li key={i}>{f}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {installationItems.length > 0 && (
+                        <div className="position-section position-section--col">
+                          <div className="position-section-label">Einbauhinweise</div>
+                          <ul className="position-features-list">
+                            {installationItems.map((f, i) => (
+                              <li key={i}>{f}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {isService && currentPosition.description && (
+                    <div className="position-section">
+                      <div className="position-section-label">Beschreibung</div>
+                      <div className="position-desc-text">{currentPosition.description}</div>
+                    </div>
+                  )}
+                </>
+              )
+            })()}
             {projectId && (
               <span
                 className={`original-lv-toggle ${showOriginalPdf ? 'open' : ''}`}
@@ -1156,191 +1241,16 @@ export function AssignmentView({
           {showOriginalPdf && projectId && (
             <div className="original-lv-panel">
               <iframe
-                key={`${currentPosition.ordnungszahl}-${currentPosition.source_page ?? 1}`}
-                src={buildOriginalPdfViewerUrl(projectId, currentPosition)}
+                key={originalPdfUrl ?? `${currentPosition.ordnungszahl}-${currentPosition.source_page ?? 1}`}
+                src={originalPdfUrl ?? ''}
                 className="original-lv-iframe"
                 title="Original LV"
               />
             </div>
           )}
 
-          {/* Multi-component position — same card design as single suggestions */}
-          {!isServiceView && isMultiComponent && currentPosition && currentComponentSuggestions && (
-            <div className="assignment-carousel-unified">
-              <div className="carousel-header">
-                <span className="carousel-title multi-component-label">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                    <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                  {currentComponentSuggestions.length} Komponenten
-                </span>
-              </div>
-              {(() => {
-                // DN consistency check
-                const dns = currentComponentSuggestions
-                  .map(cs => {
-                    const selKey = componentSelectionKey(currentPosition.id, cs.component_name)
-                    const selId = componentSelections[selKey]
-                    const selSugg = selId ? cs.suggestions.find(s => s.artikel_id === selId) : cs.suggestions[0]
-                    return selSugg?.dn
-                  })
-                  .filter((dn): dn is number => dn != null)
-                const uniqueDns = new Set(dns)
-                const dnInconsistent = uniqueDns.size > 1
-                return dnInconsistent ? (
-                  <div className="multi-component-warning">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                      <path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" stroke="#ca8a04" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                    DN-Inkonsistenz: Komponenten haben unterschiedliche Nennweiten ({Array.from(uniqueDns).map(d => `DN${d}`).join(', ')})
-                  </div>
-                ) : null
-              })()}
-              {currentComponentSuggestions.map((cs, csIndex) => {
-                const selKey = componentSelectionKey(currentPosition.id, cs.component_name)
-                const selectedId = componentSelections[selKey]
-                const topComp = cs.suggestions[0]
-                const componentIndex = componentCarouselIndices[selKey] ?? 0
-                const visibleSuggestion = cs.suggestions[componentIndex] ?? topComp
-                const componentPriceKey = componentAssignmentKey(currentPosition.id, cs.component_name)
-                const componentPriceAdjustment = priceAdjustments[componentPriceKey]
-
-                return (
-                  <div key={cs.component_name} className="component-block">
-                    <div className="component-separator">
-                      <span className="component-separator-label">{cs.component_name}</span>
-                      <span className="component-separator-qty">{cs.quantity}x</span>
-                      {cs.suggestions.length > 1 && (
-                        <div className="carousel-nav-compact">
-                          <button
-                            className="carousel-arrow-sm"
-                            disabled={componentIndex === 0}
-                            onClick={() => {
-                              const newIdx = Math.max((componentCarouselIndices[selKey] ?? componentIndex) - 1, 0)
-                              setComponentCarouselIndices((prev) => ({ ...prev, [selKey]: newIdx }))
-                              if (cs.suggestions[newIdx]) onComponentSelect?.(currentPosition.id, cs.component_name, cs.suggestions[newIdx].artikel_id)
-                            }}
-                            title="Vorheriger Vorschlag"
-                          >
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                              <path d="M18 15l-6-6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                            </svg>
-                          </button>
-                          <span className="carousel-indicator">{componentIndex + 1} / {cs.suggestions.length}</span>
-                          <button
-                            className="carousel-arrow-sm"
-                            disabled={componentIndex >= cs.suggestions.length - 1}
-                            onClick={() => {
-                              const newIdx = Math.min((componentCarouselIndices[selKey] ?? componentIndex) + 1, cs.suggestions.length - 1)
-                              setComponentCarouselIndices((prev) => ({ ...prev, [selKey]: newIdx }))
-                              if (cs.suggestions[newIdx]) onComponentSelect?.(currentPosition.id, cs.component_name, cs.suggestions[newIdx].artikel_id)
-                            }}
-                            title="Nächster Vorschlag"
-                          >
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                              <path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                            </svg>
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                    {visibleSuggestion ? (
-                      <>
-                        {selectedId && (() => {
-                          const selectedSugg = cs.suggestions.find(s => s.artikel_id === selectedId) ?? visibleSuggestion
-                          return (
-                            <PriceAdjustmentControl
-                              adjustment={componentPriceAdjustment}
-                              baseUnitPrice={selectedSugg.price_net}
-                              quantity={currentPosition.quantity}
-                              currency={selectedSugg.currency}
-                              onChange={(next) => onPriceAdjustmentChange(componentPriceKey, next)}
-                            />
-                          )
-                        })()}
-                        {renderSuggestionCard(
-                          visibleSuggestion,
-                          currentPosition,
-                          showLoadClass,
-                          csIndex === 0,
-                          undefined,
-                          selectedId ? [selectedId] : [],
-                          () => onComponentSelect?.(currentPosition.id, cs.component_name, visibleSuggestion.artikel_id),
-                        )}
-                        {selectedId && (
-                          <div className="card-flags">
-                            {onToggleAlternative && (
-                              <label className={`flag-toggle ${alternativeFlags[componentPriceKey] ? 'flag-active flag-warn' : ''}`}>
-                                <input
-                                  type="checkbox"
-                                  checked={alternativeFlags[componentPriceKey] ?? false}
-                                  onChange={() => onToggleAlternative(componentPriceKey)}
-                                />
-                                Alt. z. baus. Prüfung
-                                {alternativeFlags[componentPriceKey] && <span className="flag-badge flag-badge-warn">ALT</span>}
-                              </label>
-                            )}
-                            {onToggleSupplierOpen && (
-                              <label className={`flag-toggle ${supplierOpenFlags[componentPriceKey] ? 'flag-active flag-blue' : ''}`}>
-                                <input
-                                  type="checkbox"
-                                  checked={supplierOpenFlags[componentPriceKey] ?? false}
-                                  onChange={() => onToggleSupplierOpen(componentPriceKey)}
-                                />
-                                Lieferant offen
-                                {supplierOpenFlags[componentPriceKey] && <span className="flag-badge flag-badge-blue">OFFEN</span>}
-                              </label>
-                            )}
-                          </div>
-                        )}
-                        {cs.suggestions.length > 1 && (
-                          <div className="carousel-dots">
-                            {cs.suggestions.map((_, i) => (
-                              <button
-                                key={i}
-                                className={`carousel-dot ${i === componentIndex ? 'active' : ''}`}
-                                onClick={() => {
-                                  setComponentCarouselIndices((prev) => ({ ...prev, [selKey]: i }))
-                                  if (cs.suggestions[i]) onComponentSelect?.(currentPosition.id, cs.component_name, cs.suggestions[i].artikel_id)
-                                }}
-                              />
-                            ))}
-                          </div>
-                        )}
-                        <div className="assignment-card-tools">
-                          <button
-                            className="btn btn-ghost assignment-search-btn"
-                            onClick={() => setComponentSearchTarget({ positionId: currentPosition.id, componentName: cs.component_name })}
-                          >
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                              <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
-                              <path d="M21 21l-4.35-4.35" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                            </svg>
-                            Manuell suchen
-                          </button>
-                        </div>
-                      </>
-                    ) : (
-                      <div className="assignment-no-match assignment-no-match--compact">
-                        <p>Kein passender Artikel</p>
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-              <div className="assignment-card-tools assignment-card-tools--row">
-                <button className="btn btn-ghost assignment-search-btn" onClick={() => setAddArticleSearchOpen(true)}>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                    <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                  </svg>
-                  Artikel hinzufügen
-                </button>
-              </div>
-            </div>
-          )}
-
           {/* Unified suggestion carousel — all suggestions in one swipeable view */}
-          {!isServiceView && !isMultiComponent && carouselSuggestions.length > 0 && (
+          {!isServiceView && carouselSuggestions.length > 0 && (
             <div className="assignment-carousel-unified">
               {currentPrimaryAssignmentKey && currentSelectedArticle && pricingReferenceSuggestion && (
                 <PriceAdjustmentControl
@@ -1453,7 +1363,7 @@ export function AssignmentView({
             </div>
           )}
 
-          {!isServiceView && !isMultiComponent && carouselSuggestions.length === 0 && (
+          {!isServiceView && carouselSuggestions.length === 0 && (
             <div className="assignment-no-match">
               <div className="no-match-icon">
                 <svg width="28" height="28" viewBox="0 0 24 24" fill="none">

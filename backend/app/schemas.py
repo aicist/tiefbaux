@@ -13,18 +13,23 @@ class ComponentRequirement(BaseModel):
     product_subcategory: str | None = None
     nominal_diameter_dn: int | None = None
     secondary_nominal_diameter_dn: int | None = None
-    quantity: int = 1
+    quantity: float | None = 1
+    unit: str | None = None
     material: str | None = None
     system_family: str | None = None
     load_class: str | None = None
     dimensions: str | None = None
     connection_type: str | None = None
     installation_area: str | None = None
+    compressive_strength: str | None = None
+    exposition_class: str | None = None
+    additional_specs: list[str] | None = None
 
 
 class TechnicalParameters(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    article_type: str | None = None
     product_category: str | None = None
     product_subcategory: str | None = None
     material: str | None = None
@@ -48,6 +53,12 @@ class TechnicalParameters(BaseModel):
     seal_type: str | None = None
     compatible_systems: list[str] | None = None
     components: list[ComponentRequirement] | None = None
+    variants: list[str] | None = None
+    features: list[str] | None = None
+    installation_notes: str | None = None
+    compressive_strength: str | None = None
+    exposition_class: str | None = None
+    additional_specs: list[str] | None = None
 
 
 class LVPosition(BaseModel):
@@ -63,6 +74,7 @@ class LVPosition(BaseModel):
     position_type: Literal["material", "dienstleistung"] | None = None
     parameters: TechnicalParameters = Field(default_factory=TechnicalParameters)
     source_page: int | None = None
+    source_y: int | None = None
 
 
 class DuplicateInfo(BaseModel):
@@ -125,7 +137,7 @@ class ProductSuggestion(BaseModel):
 
 class ComponentSuggestions(BaseModel):
     component_name: str
-    quantity: int = 1
+    quantity: float | None = 1
     suggestions: list[ProductSuggestion] = Field(default_factory=list)
 
 

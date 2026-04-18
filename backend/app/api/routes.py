@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import re
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+import pdfplumber
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import Fit
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, load_only, selectinload
 
 from ..auth import get_current_user, require_admin
 from ..database import get_db
-from ..models import LVProject, LVProjectPosition, ManualOverride, Product, Supplier, SupplierInquiry, SupplierOffer, Tender, User
+from ..models import LVProject, LVProjectPosition, ManualOverride, Product, ProjectFile, Supplier, SupplierInquiry, SupplierOffer, Tender, User
 from ..schemas import (
     ComponentSuggestions,
     DuplicateInfo,
@@ -214,17 +219,153 @@ def _resolve_stored_file_path(
     return None
 
 
-def _enrich_from_pdf(positions: list[LVPosition], pdf_path: str | None) -> list[LVPosition]:
-    """Enrich positions with raw_text and correct source_page from stored PDF."""
-    resolved_pdf = _resolve_stored_file_path(pdf_path, kind="upload")
-    if not resolved_pdf:
+def _upsert_project_file(
+    db: Session,
+    *,
+    project_id: int,
+    kind: str,
+    filename: str | None,
+    content: bytes,
+) -> None:
+    existing = db.scalar(
+        select(ProjectFile).where(
+            ProjectFile.project_id == project_id,
+            ProjectFile.kind == kind,
+        )
+    )
+    if existing:
+        existing.filename = filename
+        existing.content = content
+        existing.updated_at = datetime.utcnow()
+        return
+    db.add(
+        ProjectFile(
+            project_id=project_id,
+            kind=kind,
+            filename=filename,
+            content=content,
+        )
+    )
+
+
+def _load_project_file_bytes(db: Session, *, project_id: int, kind: str) -> bytes | None:
+    row = db.scalar(
+        select(ProjectFile).where(
+            ProjectFile.project_id == project_id,
+            ProjectFile.kind == kind,
+        )
+    )
+    if not row or not row.content:
+        return None
+    return bytes(row.content)
+
+
+def _load_project_pdf_bytes(db: Session, project: LVProject) -> bytes | None:
+    resolved_pdf = _resolve_stored_file_path(project.pdf_path, kind="upload")
+    if resolved_pdf:
+        try:
+            return resolved_pdf.read_bytes()
+        except Exception as exc:
+            logger.warning("Failed to read project PDF from filesystem (project_id=%s): %s", project.id, exc)
+    return _load_project_file_bytes(db, project_id=project.id, kind="upload")
+
+
+_OZ_TOKEN_CLEAN_RE = re.compile(r"[^0-9.]")
+
+
+def _normalize_oz_token(value: str) -> str:
+    cleaned = _OZ_TOKEN_CLEAN_RE.sub("", value.strip().rstrip(".,:;"))
+    cleaned = re.sub(r"\.{2,}", ".", cleaned).strip(".")
+    if not cleaned:
+        return ""
+    parts = [part for part in cleaned.split(".") if part]
+    normalized_parts: list[str] = []
+    for part in parts:
+        try:
+            normalized_parts.append(str(int(part)))
+        except ValueError:
+            normalized_parts.append(part)
+    return ".".join(normalized_parts)
+
+
+def _find_oz_anchor(pdf_bytes: bytes, ordnungszahl: str, preferred_page: int | None = None) -> tuple[int, int] | None:
+    target = _normalize_oz_token(ordnungszahl)
+    if not target:
+        return None
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        pages: list[tuple[int, object]] = []
+        if preferred_page is not None and 1 <= preferred_page <= len(pdf.pages):
+            idx = preferred_page - 1
+            pages.append((preferred_page, pdf.pages[idx]))
+            for i, page in enumerate(pdf.pages, start=1):
+                if i != preferred_page:
+                    pages.append((i, page))
+        else:
+            pages = [(i, page) for i, page in enumerate(pdf.pages, start=1)]
+
+        best: tuple[int, int, float] | None = None  # page, top, x0
+        for page_num, page in pages:
+            words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False) or []
+            for word in words:
+                token = _normalize_oz_token(str(word.get("text") or ""))
+                if token != target:
+                    continue
+                try:
+                    top = int(float(word.get("top") or 0))
+                    x0 = float(word.get("x0") or 0)
+                except (TypeError, ValueError):
+                    top = 0
+                    x0 = 0.0
+                # Prefer OZ matches in the left column.
+                if best is None or page_num < best[0] or (page_num == best[0] and x0 < best[2]):
+                    best = (page_num, max(0, top - 20), x0)
+        if best:
+            return (best[0], best[1])
+    return None
+
+
+def _find_next_oz_top_on_page(pdf_bytes: bytes, page_num: int, current_top: int) -> int | None:
+    """Find next OZ marker on the same page to crop the snippet tightly."""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        if page_num < 1 or page_num > len(pdf.pages):
+            return None
+        words = pdf.pages[page_num - 1].extract_words(
+            x_tolerance=2,
+            y_tolerance=2,
+            keep_blank_chars=False,
+        ) or []
+
+    candidates: list[float] = []
+    for word in words:
+        token = _normalize_oz_token(str(word.get("text") or ""))
+        if not token or not re.fullmatch(r"\d+(?:\.\d+)+", token):
+            continue
+        try:
+            top = float(word.get("top") or 0)
+            x0 = float(word.get("x0") or 9999)
+        except (TypeError, ValueError):
+            continue
+        # OZ markers are typically in the left OZ column.
+        if x0 > 150:
+            continue
+        if top <= current_top + 8:
+            continue
+        candidates.append(top)
+
+    if not candidates:
+        return None
+    return int(min(candidates))
+
+
+def _enrich_from_pdf(positions: list[LVPosition], pdf_bytes: bytes | None) -> list[LVPosition]:
+    """Enrich positions with raw_text and correct source_page from stored PDF bytes."""
+    if not pdf_bytes:
         return positions
     try:
-        with open(resolved_pdf, "rb") as f:
-            pdf_bytes = f.read()
         from ..services.llm_parser import (
             _derive_description_from_raw_text,
             _extract_raw_texts_from_pages,
+            _map_oz_to_anchor_top,
             _map_oz_to_page,
             extract_raw_text_pages,
         )
@@ -232,11 +373,13 @@ def _enrich_from_pdf(positions: list[LVPosition], pdf_path: str | None) -> list[
         oz_list = [p.ordnungszahl for p in positions]
         raw_texts = _extract_raw_texts_from_pages(pdf_pages, oz_list)
         oz_pages = _map_oz_to_page(pdf_bytes, oz_list)
+        oz_tops = _map_oz_to_anchor_top(pdf_bytes, oz_list)
         return [
             p.model_copy(update={
                 **({"raw_text": raw_texts[p.ordnungszahl]} if p.ordnungszahl in raw_texts else {}),
                 **({"description": _derive_description_from_raw_text(raw_texts[p.ordnungszahl], p.description)} if p.ordnungszahl in raw_texts else {}),
                 **({"source_page": oz_pages[p.ordnungszahl]} if p.ordnungszahl in oz_pages else {}),
+                **({"source_y": oz_tops[p.ordnungszahl]} if p.ordnungszahl in oz_tops else {}),
             })
             for p in positions
         ]
@@ -390,9 +533,18 @@ async def parse_lv(file: UploadFile = File(...), db: Session = Depends(get_db), 
     existing = db.scalar(select(LVProject).where(LVProject.content_hash == content_hash))
     if existing:
         logger.info("Duplicate LV detected (hash=%s, project_id=%d)", content_hash[:12], existing.id)
+        # Ensure long-term PDF availability in serverless environments.
+        _upsert_project_file(
+            db,
+            project_id=existing.id,
+            kind="upload",
+            filename=file.filename or existing.filename or f"{content_hash}.pdf",
+            content=pdf_bytes,
+        )
+        db.commit()
         positions = _reconstruct_positions(existing.positions)
         # Enrich raw_text + source_page from stored PDF
-        positions = _enrich_from_pdf(positions, existing.pdf_path)
+        positions = _enrich_from_pdf(positions, _load_project_pdf_bytes(db, existing))
         positions = _upgrade_position_params(positions)
         metadata = ProjectMetadata(
             bauvorhaben=existing.bauvorhaben,
@@ -451,6 +603,13 @@ async def parse_lv(file: UploadFile = File(...), db: Session = Depends(get_db), 
     # Store for future duplicate detection
     try:
         project = _store_project(db, content_hash, file.filename, positions, metadata, stored_pdf_path)
+        _upsert_project_file(
+            db,
+            project_id=project.id,
+            kind="upload",
+            filename=file.filename or pdf_filename,
+            content=pdf_bytes,
+        )
         _touch_project_editor(project, current_user)
         db.commit()
         duplicate_info = DuplicateInfo(is_duplicate=False, project_id=project.id)
@@ -865,11 +1024,21 @@ def export_offer(request: ExportOfferRequest, db: Session = Depends(get_db), cur
     if request.project_id:
         project = db.get(LVProject, request.project_id)
         if project:
-            offers_dir = _offers_runtime_dir(request.project_id)
-            offers_dir.mkdir(parents=True, exist_ok=True)
-            offer_path = offers_dir / "angebot.pdf"
-            offer_path.write_bytes(pdf_bytes)
+            try:
+                offers_dir = _offers_runtime_dir(request.project_id)
+                offers_dir.mkdir(parents=True, exist_ok=True)
+                offer_path = offers_dir / "angebot.pdf"
+                offer_path.write_bytes(pdf_bytes)
+            except Exception as exc:
+                logger.warning("Failed to persist offer PDF on filesystem (project_id=%s): %s", request.project_id, exc)
             project.offer_pdf_path = str(Path("offers") / str(request.project_id) / "angebot.pdf")
+            _upsert_project_file(
+                db,
+                project_id=project.id,
+                kind="offer",
+                filename=f"angebot-{project.projekt_nr or project.id}.pdf",
+                content=pdf_bytes,
+            )
             project.status = "gerechnet"
             _touch_project_editor(project, current_user)
             db.commit()
@@ -1041,7 +1210,7 @@ def get_project(project_id: int, db: Session = Depends(get_db), current_user: Us
         project.status = effective_status
     db.commit()
     positions = _reconstruct_positions(project.positions)
-    positions = _enrich_from_pdf(positions, project.pdf_path)
+    positions = _enrich_from_pdf(positions, _load_project_pdf_bytes(db, project))
     positions = _upgrade_position_params(positions)
     metadata = ProjectMetadata(
         bauvorhaben=project.bauvorhaben,
@@ -1121,6 +1290,9 @@ def delete_project(project_id: int, db: Session = Depends(get_db), current_user:
             update(Tender)
             .where(Tender.project_id == project_id)
             .values(project_id=None)
+        )
+        db.execute(
+            delete(ProjectFile).where(ProjectFile.project_id == project_id)
         )
 
         db.delete(project)
@@ -1218,11 +1390,89 @@ def get_project_pdf(project_id: int, token: str | None = None, db: Session = Dep
     if not project:
         raise HTTPException(status_code=404, detail="Projekt nicht gefunden")
     resolved_pdf = _resolve_stored_file_path(project.pdf_path, kind="upload")
-    if not resolved_pdf:
+    if resolved_pdf:
+        return FileResponse(
+            path=resolved_pdf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{project.filename or "lv.pdf"}"'},
+        )
+
+    pdf_bytes = _load_project_file_bytes(db, project_id=project.id, kind="upload")
+    if not pdf_bytes:
         raise HTTPException(status_code=404, detail="PDF nicht verfügbar")
 
-    return FileResponse(
-        path=resolved_pdf,
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{project.filename or "lv.pdf"}"'},
+    )
+
+
+@router.get("/projects/{project_id}/pdf-anchor")
+def get_project_pdf_anchor(
+    project_id: int,
+    oz: str | None = None,
+    page: int | None = None,
+    top: int | None = None,
+    window: int = 220,
+    token: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """Serve full PDF and set open destination to the anchored OZ/page."""
+    from ..auth import _resolve_user_from_token
+
+    _resolve_user_from_token(token, db)
+    project = db.get(LVProject, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Projekt nicht gefunden")
+
+    pdf_bytes = _load_project_pdf_bytes(db, project)
+    if not pdf_bytes:
+        raise HTTPException(status_code=404, detail="PDF nicht verfügbar")
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception as exc:
+        logger.warning("Failed to read project PDF for anchor view (project_id=%s): %s", project_id, exc)
+        raise HTTPException(status_code=500, detail="PDF konnte nicht gelesen werden")
+
+    if len(reader.pages) == 0:
+        raise HTTPException(status_code=404, detail="PDF enthält keine Seiten")
+
+    page_index = max(0, min((page or 1) - 1, len(reader.pages) - 1))
+    anchor_top_from_top = top
+    if oz:
+        anchor = _find_oz_anchor(pdf_bytes, oz, preferred_page=page)
+        if anchor:
+            page, anchor_top_from_top = anchor
+            page_index = max(0, min((page or 1) - 1, len(reader.pages) - 1))
+
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+
+    try:
+        selected_page = writer.pages[page_index]
+        page_height = max(1.0, float(selected_page.mediabox.top) - float(selected_page.mediabox.bottom))
+        if anchor_top_from_top is not None:
+            y_from_top = max(0.0, min(float(anchor_top_from_top), page_height))
+            fit_top = page_height - y_from_top
+            writer.open_destination = (selected_page, Fit.xyz(left=0, top=fit_top, zoom=None))
+        else:
+            writer.open_destination = (selected_page, Fit.fit_horizontally())
+    except Exception as exc:
+        logger.warning(
+            "Failed to set open destination for anchored PDF (project_id=%s, page=%s, top=%s): %s",
+            project_id,
+            page,
+            anchor_top_from_top,
+            exc,
+        )
+
+    out = io.BytesIO()
+    writer.write(out)
+    anchored_bytes = out.getvalue()
+    return StreamingResponse(
+        iter([anchored_bytes]),
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{project.filename or "lv.pdf"}"'},
     )
@@ -1237,11 +1487,19 @@ def get_project_offer_pdf(project_id: int, token: str | None = None, db: Session
     if not project:
         raise HTTPException(status_code=404, detail="Projekt nicht gefunden")
     resolved_offer = _resolve_stored_file_path(project.offer_pdf_path, kind="offer", project_id=project.id)
-    if not resolved_offer:
+    if resolved_offer:
+        return FileResponse(
+            path=resolved_offer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="angebot-{project.projekt_nr or project.id}.pdf"'},
+        )
+
+    offer_bytes = _load_project_file_bytes(db, project_id=project.id, kind="offer")
+    if not offer_bytes:
         raise HTTPException(status_code=404, detail="Angebots-PDF nicht verfügbar")
 
-    return FileResponse(
-        path=resolved_offer,
+    return StreamingResponse(
+        iter([offer_bytes]),
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="angebot-{project.projekt_nr or project.id}.pdf"'},
     )

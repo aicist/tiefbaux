@@ -40,3 +40,11 @@ output_review_offer*
 # Excel
 *.xlsx
 .vercel
+
+# Local work artifacts
+.claude/
+output/
+tmp/
+/tiefbaux.db
+*.pre_rollback.bak
+/api/

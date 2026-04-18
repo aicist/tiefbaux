@@ -5,16 +5,21 @@ export type ComponentRequirement = {
   product_subcategory?: string | null
   nominal_diameter_dn?: number | null
   secondary_nominal_diameter_dn?: number | null
-  quantity: number
+  quantity?: number | null
+  unit?: string | null
   material?: string | null
   system_family?: string | null
   load_class?: string | null
   dimensions?: string | null
   connection_type?: string | null
   installation_area?: string | null
+  compressive_strength?: string | null
+  exposition_class?: string | null
+  additional_specs?: string[] | null
 }
 
 export type TechnicalParameters = {
+  article_type?: string | null
   product_category?: string | null
   product_subcategory?: string | null
   material?: string | null
@@ -38,6 +43,12 @@ export type TechnicalParameters = {
   seal_type?: string | null
   compatible_systems?: string[] | null
   components?: ComponentRequirement[] | null
+  variants?: string[] | null
+  features?: string[] | null
+  installation_notes?: string | null
+  compressive_strength?: string | null
+  exposition_class?: string | null
+  additional_specs?: string[] | null
 }
 
 export type LVPosition = {
@@ -51,6 +62,7 @@ export type LVPosition = {
   position_type?: 'material' | 'dienstleistung' | null
   parameters: TechnicalParameters
   source_page?: number | null
+  source_y?: number | null
 }
 
 export type ScoreBreakdown = {

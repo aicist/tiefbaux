@@ -285,6 +285,25 @@ export function getProjectPdfUrl(projectId: number): string {
   return `${API_BASE}/projects/${projectId}/pdf${token ? `?token=${token}` : ''}`
 }
 
+export function getProjectPdfAnchorUrl(
+  projectId: number,
+  options?: { oz?: string | null; page?: number | null; top?: number | null; window?: number | null },
+): string {
+  const token = getAuthToken()
+  const params = new URLSearchParams()
+  if (token) params.set('token', token)
+  const oz = options?.oz?.trim()
+  if (oz) params.set('oz', oz)
+  const page = options?.page
+  if (page != null) params.set('page', String(Math.max(1, Math.trunc(page))))
+  const top = options?.top
+  if (top != null) params.set('top', String(Math.max(0, Math.trunc(top))))
+  const win = options?.window
+  if (win != null) params.set('window', String(Math.max(120, Math.trunc(win))))
+  const query = params.toString()
+  return `${API_BASE}/projects/${projectId}/pdf-anchor${query ? `?${query}` : ''}`
+}
+
 export function getProjectOfferPdfUrl(projectId: number): string {
   const token = getAuthToken()
   return `${API_BASE}/projects/${projectId}/offer-pdf${token ? `?token=${token}` : ''}`

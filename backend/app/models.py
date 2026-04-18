@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -136,6 +136,23 @@ class LVProjectPosition(Base):
     source_page: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     project = relationship("LVProject", back_populates="positions")
+
+
+class ProjectFile(Base):
+    __tablename__ = "project_files"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("lv_projects.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)  # upload | offer
+    filename: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    content: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    project = relationship("LVProject")
+
+
+Index("ix_project_files_project_kind", ProjectFile.project_id, ProjectFile.kind, unique=True)
 
 
 class Supplier(Base):

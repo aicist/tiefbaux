@@ -6,6 +6,9 @@ type Props = {
   onLoadProject: (projectId: number) => void
 }
 
+const ARCHIVE_CACHE_TTL_MS = 60_000
+let archiveProjectsCache: { projects: ProjectSummary[]; ts: number } | null = null
+
 function statusLabel(status?: string): string {
   if (status === 'gerechnet') return 'Gerechnet'
   if (status === 'anfrage_offen') return 'Anfrage offen'
@@ -14,18 +17,30 @@ function statusLabel(status?: string): string {
 }
 
 export function ProjectArchive({ onLoadProject }: Props) {
-  const [projects, setProjects] = useState<ProjectSummary[]>([])
-  const [loading, setLoading] = useState(true)
+  const [projects, setProjects] = useState<ProjectSummary[]>(() => archiveProjectsCache?.projects ?? [])
+  const [loading, setLoading] = useState(() => !archiveProjectsCache)
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const didInitialLoad = useRef(false)
 
   const loadProjects = useCallback(async (q?: string) => {
-    setLoading(true)
+    const normalizedQuery = q?.trim() ?? ''
+    const isDefaultQuery = normalizedQuery.length === 0
+    const hasFreshDefaultCache = Boolean(
+      isDefaultQuery
+      && archiveProjectsCache
+      && (Date.now() - archiveProjectsCache.ts) < ARCHIVE_CACHE_TTL_MS,
+    )
+    if (!hasFreshDefaultCache) {
+      setLoading(true)
+    }
     try {
-      const data = await fetchProjects(q || undefined)
+      const data = await fetchProjects(normalizedQuery || undefined)
       setProjects(data)
+      if (isDefaultQuery) {
+        archiveProjectsCache = { projects: data, ts: Date.now() }
+      }
     } catch {
       setProjects([])
     } finally {
@@ -36,6 +51,12 @@ export function ProjectArchive({ onLoadProject }: Props) {
   useEffect(() => {
     if (!didInitialLoad.current) {
       didInitialLoad.current = true
+      if (archiveProjectsCache && (Date.now() - archiveProjectsCache.ts) < ARCHIVE_CACHE_TTL_MS) {
+        setProjects(archiveProjectsCache.projects)
+        setLoading(false)
+        void loadProjects()
+        return
+      }
       loadProjects()
       return
     }
@@ -58,6 +79,13 @@ export function ProjectArchive({ onLoadProject }: Props) {
     try {
       await deleteProject(project.id)
       setProjects((prev) => prev.filter((p) => p.id !== project.id))
+      if (archiveProjectsCache) {
+        archiveProjectsCache = {
+          ...archiveProjectsCache,
+          projects: archiveProjectsCache.projects.filter((p) => p.id !== project.id),
+          ts: Date.now(),
+        }
+      }
     } catch (error) {
       const message = error instanceof ApiError
         ? error.message

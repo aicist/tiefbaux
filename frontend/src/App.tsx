@@ -20,6 +20,7 @@ import { useAnalysis } from './hooks/useAnalysis'
 import { useAuth } from './hooks/useAuth'
 import type { AppView, User } from './types'
 import { primaryAssignmentKey } from './utils/assignmentKeys'
+import { buildEmbeddedPdfViewerUrl } from './utils/pdfViewer'
 
 type ErrorBoundaryProps = { children: React.ReactNode }
 type ErrorBoundaryState = { error: Error | null }
@@ -83,6 +84,9 @@ function AuthenticatedApp({ user, isAdmin, onLogout }: { user: User; isAdmin: bo
   }, [analysis.assignmentUiState, analysis.handleAssignmentUiStateChange])
 
   const hasResults = analysis.step === 'done'
+  const projectPdfViewerUrl = analysis.projectId
+    ? buildEmbeddedPdfViewerUrl(getProjectPdfUrl(analysis.projectId), { page: 1 })
+    : null
 
   return (
     <main className="app-shell">
@@ -251,7 +255,7 @@ function AuthenticatedApp({ user, isAdmin, onLogout }: { user: User; isAdmin: bo
                     </button>
                   </div>
                   <iframe
-                    src={getProjectPdfUrl(analysis.projectId)}
+                    src={projectPdfViewerUrl ?? getProjectPdfUrl(analysis.projectId)}
                     className="pdf-viewer-frame"
                     title="Original LV PDF"
                   />

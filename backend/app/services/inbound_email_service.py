@@ -22,7 +22,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import InboundEmailEvent, LVProject, LVProjectPosition, Supplier, SupplierInquiry, SupplierOffer
+from ..models import InboundEmailEvent, LVProject, LVProjectPosition, ProjectFile, Supplier, SupplierInquiry, SupplierOffer
 from ..schemas import LVPosition, ProjectMetadata
 from .ai_interpreter import _infer_with_heuristics, enrich_positions_with_parameters
 from .llm_parser import _inherit_reference_context, _merge_heuristic_parameters, finalize_position_descriptions, parse_lv_with_llm
@@ -466,6 +466,34 @@ def _store_uploaded_pdf(content_hash: str, data: bytes) -> str | None:
     return str(Path("uploads") / f"{content_hash}.pdf")
 
 
+def _upsert_project_upload_file(
+    db: Session,
+    *,
+    project_id: int,
+    filename: str | None,
+    content: bytes,
+) -> None:
+    existing = db.scalar(
+        select(ProjectFile).where(
+            ProjectFile.project_id == project_id,
+            ProjectFile.kind == "upload",
+        )
+    )
+    if existing:
+        existing.filename = filename
+        existing.content = content
+        existing.updated_at = datetime.utcnow()
+        return
+    db.add(
+        ProjectFile(
+            project_id=project_id,
+            kind="upload",
+            filename=filename,
+            content=content,
+        )
+    )
+
+
 def _classify_email(subject: str, body: str, attachments: list[_Attachment]) -> str:
     attachment_names = " ".join(att.filename for att in attachments if att.filename)
     text = f"{subject}\n{body}\n{attachment_names}".lower()
@@ -714,6 +742,12 @@ def _handle_new_lv_email(
             metadata=metadata,
             pdf_path=pdf_path,
             fallback_project_name=subject[:255] if subject else None,
+        )
+        _upsert_project_upload_file(
+            db,
+            project_id=project.id,
+            filename=attachment.filename or f"{content_hash}.pdf",
+            content=pdf_bytes,
         )
         created_project_ids.append(project.id)
 
