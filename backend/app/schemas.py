@@ -119,6 +119,8 @@ class ProductSuggestion(BaseModel):
     sn: int | None = None
     load_class: str | None = None
     norm: str | None = None
+    material: str | None = None
+    angle_deg: int | None = None
     stock: int | None = None
     delivery_days: int | None = None
     price_net: float | None = None
@@ -131,6 +133,7 @@ class ProductSuggestion(BaseModel):
     score_breakdown: list[ScoreBreakdown] = Field(default_factory=list)
     is_override: bool = False
     is_supplier_offer: bool = False
+    is_bogen_fallback: bool = False
     supplier_offer_id: int | None = None
     supplier_name: str | None = None
 
@@ -168,6 +171,7 @@ class ExportOfferRequest(BaseModel):
     project_name: str | None = None
     alternative_flags: dict[str, bool] = Field(default_factory=dict)
     supplier_open_flags: dict[str, bool] = Field(default_factory=dict)
+    rejected_position_ids: list[str] = Field(default_factory=list)
     project_id: int | None = None
 
 
@@ -200,11 +204,30 @@ class ExportWarning(BaseModel):
     reason: str
 
 
+class OfferEmailDefaults(BaseModel):
+    customer_email: str | None = None
+    subject: str
+    body: str
+
+
 class ExportPreviewResponse(BaseModel):
     included_count: int
     total_count: int
     skipped_positions: list[ExportWarning] = Field(default_factory=list)
     total_net: float
+    email_defaults: OfferEmailDefaults | None = None
+
+
+class SendOfferEmailRequest(ExportOfferRequest):
+    customer_email: str
+    email_subject: str
+    email_body: str
+
+
+class SendOfferEmailResponse(BaseModel):
+    sent: bool
+    saved: bool
+    detail: str | None = None
 
 
 class ProductSearchResult(BaseModel):
@@ -245,10 +268,66 @@ class ProjectSummary(BaseModel):
     submission_date: str | None = None
     kunde_name: str | None = None
     status: str = "neu"
+    anfrage_art: str = "submission"
     offer_pdf_path: str | None = None
     assigned_user_name: str | None = None
     last_editor_name: str | None = None
     last_edited_at: datetime | None = None
+
+
+class KundenOrdnerSummary(BaseModel):
+    kunde_id: int
+    slug: str
+    name: str
+    display_name: str | None = None
+    email_domain: str | None = None
+    project_count: int
+    latest_project_created_at: datetime | None = None
+
+
+class ObjektSummary(BaseModel):
+    id: int
+    slug: str
+    bauvorhaben: str | None = None
+    objekt_nr: str | None = None
+    auftraggeber: str | None = None
+    submission_date: str | None = None
+    created_at: datetime
+    kunden_count: int
+    project_count: int
+    latest_project_created_at: datetime | None = None
+
+
+class ObjektDetailResponse(BaseModel):
+    objekt: ObjektSummary
+    kunden: list[KundenOrdnerSummary] = Field(default_factory=list)
+
+
+class KundenProjektListResponse(BaseModel):
+    objekt: ObjektSummary
+    kunde: KundenOrdnerSummary
+    projects: list[ProjectSummary] = Field(default_factory=list)
+
+
+class ObjektUpdate(BaseModel):
+    bauvorhaben: str | None = None
+    objekt_nr: str | None = None
+    auftraggeber: str | None = None
+    submission_date: str | None = None
+
+
+class KundeUpdate(BaseModel):
+    name: str | None = None
+    display_name: str | None = None
+    email_domain: str | None = None
+    address: str | None = None
+
+
+class ProjectUpdate(BaseModel):
+    project_name: str | None = None
+    bauvorhaben: str | None = None
+    submission_date: str | None = None
+    anfrage_art: str | None = None
 
 
 class AssignmentUiState(BaseModel):

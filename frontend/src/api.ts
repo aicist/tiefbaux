@@ -1,4 +1,4 @@
-import type { AssignmentUiState, ExportPreviewResponse, InboxSyncResult, InboxSyncStatus, LVPosition, ParseResponse, PositionSuggestions, ProductSearchResponse, ProjectDetailResponse, ProjectSummary, Supplier, SupplierInquiry, SupplierOffer, SuggestionResponse, TechnicalParameters, Tender, User } from './types'
+import type { AssignmentUiState, ExportPreviewResponse, InboxSyncResult, InboxSyncStatus, KundenProjektListResponse, LVPosition, ObjektDetailResponse, ObjektSummary, ParseResponse, PositionSuggestions, ProductSearchResponse, ProjectDetailResponse, ProjectSummary, Supplier, SupplierInquiry, SupplierOffer, SuggestionResponse, TechnicalParameters, Tender, User } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000/api'
 const AUTH_BASE = API_BASE.replace(/\/api$/, '/api/auth')
@@ -125,6 +125,7 @@ export async function fetchExportPreview(
   alternativeFlags?: Record<string, boolean>,
   supplierOpenFlags?: Record<string, boolean>,
   assignmentKeysByPosition?: Record<string, string[]>,
+  rejectedPositionIds?: string[],
 ): Promise<ExportPreviewResponse> {
   const response = await wrapFetch(
     fetch(`${API_BASE}/export-preview`, {
@@ -139,6 +140,7 @@ export async function fetchExportPreview(
         alternative_flags: alternativeFlags,
         supplier_open_flags: supplierOpenFlags,
         assignment_keys_by_position: assignmentKeysByPosition,
+        rejected_position_ids: rejectedPositionIds,
       }),
     }),
   )
@@ -155,6 +157,7 @@ export async function exportOffer(
   supplierOpenFlags?: Record<string, boolean>,
   assignmentKeysByPosition?: Record<string, string[]>,
   projectId?: number | null,
+  rejectedPositionIds?: string[],
 ): Promise<Blob> {
   const response = await wrapFetch(
     fetch(`${API_BASE}/export-offer`, {
@@ -170,6 +173,7 @@ export async function exportOffer(
         supplier_open_flags: supplierOpenFlags,
         assignment_keys_by_position: assignmentKeysByPosition,
         project_id: projectId ?? undefined,
+        rejected_position_ids: rejectedPositionIds,
       }),
     }),
   )
@@ -186,6 +190,88 @@ export async function exportOffer(
   }
 
   return await response.blob()
+}
+
+export async function fetchOfferPdfPreview(
+  positions: LVPosition[],
+  selectedArticleIds: Record<string, string[]>,
+  customerName: string,
+  projectName: string,
+  customUnitPrices?: Record<string, number>,
+  alternativeFlags?: Record<string, boolean>,
+  supplierOpenFlags?: Record<string, boolean>,
+  assignmentKeysByPosition?: Record<string, string[]>,
+  projectId?: number | null,
+  rejectedPositionIds?: string[],
+): Promise<Blob> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/export-offer/preview-pdf`, {
+      method: 'POST',
+      headers: jsonAuthHeaders(),
+      body: JSON.stringify({
+        positions,
+        selected_article_ids: selectedArticleIds,
+        customer_name: customerName,
+        project_name: projectName,
+        custom_unit_prices: customUnitPrices,
+        alternative_flags: alternativeFlags,
+        supplier_open_flags: supplierOpenFlags,
+        assignment_keys_by_position: assignmentKeysByPosition,
+        project_id: projectId ?? undefined,
+        rejected_position_ids: rejectedPositionIds,
+      }),
+    }),
+  )
+  if (!response.ok) {
+    let detail = ''
+    try {
+      const body = await response.json()
+      detail = body.detail ?? ''
+    } catch {
+      detail = await response.text()
+    }
+    throw new ApiError(detail || 'PDF-Vorschau fehlgeschlagen', 'api', response.status)
+  }
+  return await response.blob()
+}
+
+export async function sendOfferEmail(
+  positions: LVPosition[],
+  selectedArticleIds: Record<string, string[]>,
+  customerName: string,
+  projectName: string,
+  customerEmail: string,
+  emailSubject: string,
+  emailBody: string,
+  customUnitPrices?: Record<string, number>,
+  alternativeFlags?: Record<string, boolean>,
+  supplierOpenFlags?: Record<string, boolean>,
+  assignmentKeysByPosition?: Record<string, string[]>,
+  projectId?: number | null,
+  rejectedPositionIds?: string[],
+): Promise<import('./types').SendOfferEmailResponse> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/export-offer/send-email`, {
+      method: 'POST',
+      headers: jsonAuthHeaders(),
+      body: JSON.stringify({
+        positions,
+        selected_article_ids: selectedArticleIds,
+        customer_name: customerName,
+        project_name: projectName,
+        customer_email: customerEmail,
+        email_subject: emailSubject,
+        email_body: emailBody,
+        custom_unit_prices: customUnitPrices,
+        alternative_flags: alternativeFlags,
+        supplier_open_flags: supplierOpenFlags,
+        assignment_keys_by_position: assignmentKeysByPosition,
+        project_id: projectId ?? undefined,
+        rejected_position_ids: rejectedPositionIds,
+      }),
+    }),
+  )
+  return handleResponse<import('./types').SendOfferEmailResponse>(response)
 }
 
 export async function searchProducts(params: {
@@ -223,6 +309,24 @@ export async function fetchProjects(q?: string): Promise<ProjectSummary[]> {
   return handleResponse<ProjectSummary[]>(response)
 }
 
+export async function fetchObjekte(q?: string): Promise<ObjektSummary[]> {
+  const params = q ? `?q=${encodeURIComponent(q)}` : ''
+  const response = await wrapFetch(fetch(`${API_BASE}/objekte${params}`, { headers: authHeaders() }))
+  return handleResponse<ObjektSummary[]>(response)
+}
+
+export async function fetchObjekt(objektId: number): Promise<ObjektDetailResponse> {
+  const response = await wrapFetch(fetch(`${API_BASE}/objekte/${objektId}`, { headers: authHeaders() }))
+  return handleResponse<ObjektDetailResponse>(response)
+}
+
+export async function fetchKundeProjects(objektId: number, kundeId: number): Promise<KundenProjektListResponse> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/objekte/${objektId}/kunden/${kundeId}/projects`, { headers: authHeaders() }),
+  )
+  return handleResponse<KundenProjektListResponse>(response)
+}
+
 export async function fetchProject(projectId: number): Promise<ProjectDetailResponse> {
   const response = await wrapFetch(fetch(`${API_BASE}/projects/${projectId}`, { headers: authHeaders() }))
   return handleResponse<ProjectDetailResponse>(response)
@@ -235,6 +339,62 @@ export async function deleteProject(projectId: number): Promise<void> {
   if (!response.ok) {
     await handleResponse(response)
   }
+}
+
+export async function updateObjekt(
+  objektId: number,
+  updates: { bauvorhaben?: string | null; objekt_nr?: string | null; auftraggeber?: string | null; submission_date?: string | null },
+): Promise<ObjektSummary> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/objekte/${objektId}`, {
+      method: 'PATCH',
+      headers: jsonAuthHeaders(),
+      body: JSON.stringify(updates),
+    }),
+  )
+  return handleResponse<ObjektSummary>(response)
+}
+
+export async function deleteObjekt(objektId: number): Promise<{ ok: boolean; deleted_projects: number }> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/objekte/${objektId}`, { method: 'DELETE', headers: authHeaders() }),
+  )
+  return handleResponse<{ ok: boolean; deleted_projects: number }>(response)
+}
+
+export async function updateKunde(
+  kundeId: number,
+  updates: { name?: string; display_name?: string | null; email_domain?: string | null; address?: string | null },
+): Promise<import('./types').KundenOrdnerSummary> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/kunden/${kundeId}`, {
+      method: 'PATCH',
+      headers: jsonAuthHeaders(),
+      body: JSON.stringify(updates),
+    }),
+  )
+  return handleResponse<import('./types').KundenOrdnerSummary>(response)
+}
+
+export async function deleteKunde(kundeId: number): Promise<{ ok: boolean; deleted_projects: number }> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/kunden/${kundeId}`, { method: 'DELETE', headers: authHeaders() }),
+  )
+  return handleResponse<{ ok: boolean; deleted_projects: number }>(response)
+}
+
+export async function updateProject(
+  projectId: number,
+  updates: { project_name?: string | null; bauvorhaben?: string | null; submission_date?: string | null; anfrage_art?: string | null },
+): Promise<ProjectSummary> {
+  const response = await wrapFetch(
+    fetch(`${API_BASE}/projects/${projectId}`, {
+      method: 'PATCH',
+      headers: jsonAuthHeaders(),
+      body: JSON.stringify(updates),
+    }),
+  )
+  return handleResponse<ProjectSummary>(response)
 }
 
 export async function saveSelections(projectId: number, selectedArticleIds: Record<string, string[]>): Promise<void> {

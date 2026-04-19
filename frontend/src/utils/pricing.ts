@@ -42,3 +42,26 @@ export function isAdjustedPrice(
   if (baseUnitPrice == null || adjustedUnitPrice == null) return false
   return Math.abs(adjustedUnitPrice - baseUnitPrice) >= 0.01
 }
+
+// Liefert die effektive VK-Kalkulation für einen Zusatzartikel:
+// eigene manuelle Anpassung hat Vorrang, ansonsten wird die relative Höhe
+// der Hauptartikel-Kalkulation übernommen (absolute Modi werden anhand des
+// Hauptartikel-Basispreises in Prozent umgerechnet).
+export function resolveEffectivePriceAdjustment(
+  ownAdjustment: PriceAdjustment | undefined,
+  primaryAdjustment: PriceAdjustment | undefined,
+  primaryBaseUnitPrice?: number | null,
+): PriceAdjustment | undefined {
+  if (ownAdjustment && parseAdjustmentValue(ownAdjustment.value) != null) {
+    return ownAdjustment
+  }
+  if (!primaryAdjustment) return undefined
+  const primaryValue = parseAdjustmentValue(primaryAdjustment.value)
+  if (primaryValue == null) return undefined
+  if (primaryAdjustment.mode === 'percent') {
+    return primaryAdjustment
+  }
+  if (primaryBaseUnitPrice == null || primaryBaseUnitPrice <= 0) return undefined
+  const implicitPercent = ((primaryValue - primaryBaseUnitPrice) / primaryBaseUnitPrice) * 100
+  return { mode: 'percent', value: implicitPercent.toFixed(2) }
+}

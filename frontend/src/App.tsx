@@ -10,7 +10,6 @@ import { LoginScreen } from './components/LoginScreen'
 import { PositionsList } from './components/PositionsList'
 import { ProgressOverlay } from './components/ProgressOverlay'
 import { ProjectArchive } from './components/ProjectArchive'
-import { ProjectOverview } from './components/ProjectOverview'
 import { TenderRadar } from './components/TenderRadar'
 import { ProjectHeader } from './components/ProjectHeader'
 import { StatsBar } from './components/StatsBar'
@@ -99,24 +98,7 @@ function AuthenticatedApp({ user, isAdmin, onLogout }: { user: User; isAdmin: bo
 
       {activeView === 'analysis' ? (
         <>
-          {/* Read-only mode for completed projects */}
-          {analysis.isReadOnly && hasResults && analysis.projectId ? (
-            <ProjectOverview
-              metadata={analysis.metadata}
-              projectId={analysis.projectId}
-              projectName={analysis.projectName}
-              projectStatus={analysis.projectUserInfo.status}
-              offerPdfPath={analysis.projectUserInfo.offer_pdf_path}
-              positions={analysis.positions}
-              onBack={() => { analysis.handleReset(); setAssignmentMode(false); setActiveView('archive') }}
-              lastEditorName={analysis.projectUserInfo.last_editor_name}
-              lastEditedAt={analysis.projectUserInfo.last_edited_at}
-              assignedUserName={analysis.projectUserInfo.assigned_user_name}
-              suggestionMap={analysis.suggestionMap}
-              selectedArticleIds={analysis.selectedArticleIds}
-              decisions={analysis.positionDecisions}
-            />
-          ) : assignmentMode && hasResults ? (
+          {assignmentMode && hasResults ? (
             <>
               {analysis.metadata && (
                 <ProjectHeader metadata={analysis.metadata} />
@@ -151,6 +133,7 @@ function AuthenticatedApp({ user, isAdmin, onLogout }: { user: User; isAdmin: bo
                 persistedUiState={analysis.assignmentUiState}
                 onUiStateChange={analysis.handleAssignmentUiStateChange}
                 onRefreshInquiries={analysis.handleRefreshInquiries}
+                errorText={analysis.errorText}
               />
             </>
           ) : (
@@ -269,9 +252,15 @@ function AuthenticatedApp({ user, isAdmin, onLogout }: { user: User; isAdmin: bo
           <ExportConfirmDialog
             isOpen={analysis.showExportDialog}
             preview={analysis.exportPreview}
-            onConfirm={analysis.handleExportConfirm}
+            onDownload={analysis.handleExportConfirm}
+            onSendEmail={analysis.handleSendOfferEmail}
+            onPreviewPdf={analysis.handlePreviewOfferPdf}
             onCancel={analysis.handleExportCancel}
             isExporting={analysis.isExporting}
+            isSending={analysis.isSendingOfferEmail}
+            isPreviewingPdf={analysis.isPreviewingOfferPdf}
+            sendResultMessage={analysis.sendOfferResult?.message ?? null}
+            sendResultKind={analysis.sendOfferResult?.kind ?? null}
           />
         </>
       ) : activeView === 'radar' ? (

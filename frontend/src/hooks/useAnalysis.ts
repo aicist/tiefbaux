@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ApiError, cleanupOpenInquiriesForPosition, exportOffer, fetchExportPreview, fetchInquiries, fetchProject, fetchSingleSuggestions, fetchSuggestions, parseLV, recordOverride, saveSelections, saveWorkstate } from '../api'
+import { ApiError, cleanupOpenInquiriesForPosition, exportOffer, fetchExportPreview, fetchInquiries, fetchOfferPdfPreview, fetchProject, fetchSingleSuggestions, fetchSuggestions, parseLV, recordOverride, saveSelections, saveWorkstate, sendOfferEmail } from '../api'
 import type {
   AssignmentUiState,
   AnalysisStep,
@@ -16,7 +16,7 @@ import type {
   TechnicalParameters,
   UndoAction,
 } from '../types'
-import { computeAdjustedTotal, computeAdjustedUnitPrice, isAdjustedPrice } from '../utils/pricing'
+import { computeAdjustedTotal, computeAdjustedUnitPrice, isAdjustedPrice, resolveEffectivePriceAdjustment } from '../utils/pricing'
 import { additionalAssignmentKey, componentAssignmentKey, componentSelectionKey, primaryAssignmentKey } from '../utils/assignmentKeys'
 
 function normalizeText(value?: string | null): string {
@@ -135,6 +135,9 @@ export function useAnalysis() {
   const [isExporting, setIsExporting] = useState(false)
   const [exportPreview, setExportPreview] = useState<ExportPreviewResponse | null>(null)
   const [showExportDialog, setShowExportDialog] = useState(false)
+  const [isSendingOfferEmail, setIsSendingOfferEmail] = useState(false)
+  const [sendOfferResult, setSendOfferResult] = useState<{ kind: 'success' | 'error'; message: string } | null>(null)
+  const [isPreviewingOfferPdf, setIsPreviewingOfferPdf] = useState(false)
   const [isRefreshingSuggestions, setIsRefreshingSuggestions] = useState(false)
   const [duplicateInfo, setDuplicateInfo] = useState<DuplicateInfo | null>(null)
   const [metadata, setMetadata] = useState<ProjectMetadata | null>(null)
@@ -248,13 +251,16 @@ export function useAnalysis() {
       if (position?.position_type === 'dienstleistung') continue
       const suggestions = suggestionMap[posId]
       if (!suggestions) continue
+      const primaryMatch = suggestions.find((s) => s.artikel_id === artIds[0])
+      const primaryAdjustment =
+        priceAdjustments[primaryAssignmentKey(posId)] ?? categoryAdjustments[primaryMatch?.category ?? '']
       for (let i = 0; i < artIds.length; i++) {
         const match = suggestions.find((s) => s.artikel_id === artIds[i])
         const assignmentKey = i === 0 ? primaryAssignmentKey(posId) : additionalAssignmentKey(posId, artIds[i])
-        const unitPrice = computeAdjustedUnitPrice(
-          match?.price_net,
-          priceAdjustments[assignmentKey] ?? (i === 0 ? categoryAdjustments[match?.category ?? ''] : undefined),
-        )
+        const effectiveAdjustment = i === 0
+          ? primaryAdjustment
+          : resolveEffectivePriceAdjustment(priceAdjustments[assignmentKey], primaryAdjustment, primaryMatch?.price_net)
+        const unitPrice = computeAdjustedUnitPrice(match?.price_net, effectiveAdjustment)
         const artTotal = computeAdjustedTotal(unitPrice, position?.quantity)
         if (artTotal != null) total += artTotal
       }
@@ -292,10 +298,17 @@ export function useAnalysis() {
         prices[primaryKey] = adjustedUnitPrice
       }
 
+      const primaryAdjustment =
+        priceAdjustments[primaryKey] ?? categoryAdjustments[match?.category ?? '']
       for (const artikelId of artIds.slice(1)) {
         const assignmentKey = additionalAssignmentKey(posId, artikelId)
         const article = suggestions?.find((s) => s.artikel_id === artikelId)
-        const articleAdjustedUnitPrice = computeAdjustedUnitPrice(article?.price_net, priceAdjustments[assignmentKey])
+        const effectiveAdjustment = resolveEffectivePriceAdjustment(
+          priceAdjustments[assignmentKey],
+          primaryAdjustment,
+          match?.price_net,
+        )
+        const articleAdjustedUnitPrice = computeAdjustedUnitPrice(article?.price_net, effectiveAdjustment)
         if (isAdjustedPrice(article?.price_net, articleAdjustedUnitPrice) && articleAdjustedUnitPrice != null) {
           prices[assignmentKey] = articleAdjustedUnitPrice
         }
@@ -421,7 +434,8 @@ export function useAnalysis() {
       const compDefaults: Record<string, string> = {}
       suggestionData.suggestions.forEach((entry) => {
         if (entry.suggestions.length > 0) {
-          defaults[entry.position_id] = [entry.suggestions[0].artikel_id]
+          const fallbackIds = entry.suggestions.filter((s) => s.is_bogen_fallback).map((s) => s.artikel_id)
+          defaults[entry.position_id] = fallbackIds.length > 0 ? fallbackIds : [entry.suggestions[0].artikel_id]
         }
         if (entry.component_suggestions) {
           for (const cs of entry.component_suggestions) {
@@ -830,6 +844,9 @@ export function useAnalysis() {
     setErrorText(null)
 
     const activeSelections = buildActiveSelections()
+    const rejectedPositionIds = Object.entries(positionDecisions)
+      .filter(([, decision]) => decision === 'rejected')
+      .map(([posId]) => posId)
 
     try {
       const preview = await fetchExportPreview(
@@ -841,8 +858,10 @@ export function useAnalysis() {
         alternativeFlags,
         supplierOpenFlags,
         activeSelections.assignmentKeysByPosition,
+        rejectedPositionIds,
       )
       setExportPreview(preview)
+      setSendOfferResult(null)
       setShowExportDialog(true)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unbekannter Fehler'
@@ -850,7 +869,7 @@ export function useAnalysis() {
     } finally {
       setIsExporting(false)
     }
-  }, [positions, selectedCount, customerName, projectName, customUnitPrices, alternativeFlags, supplierOpenFlags, buildActiveSelections])
+  }, [positions, selectedCount, customerName, projectName, customUnitPrices, alternativeFlags, supplierOpenFlags, buildActiveSelections, positionDecisions])
 
   const handleExportConfirm = useCallback(async () => {
     if (isExporting) return
@@ -859,6 +878,9 @@ export function useAnalysis() {
     setErrorText(null)
 
     const activeSelections = buildActiveSelections()
+    const rejectedPositionIds = Object.entries(positionDecisions)
+      .filter(([, decision]) => decision === 'rejected')
+      .map(([posId]) => posId)
 
     try {
       const blob = await exportOffer(
@@ -871,6 +893,7 @@ export function useAnalysis() {
         supplierOpenFlags,
         activeSelections.assignmentKeysByPosition,
         projectId,
+        rejectedPositionIds,
       )
       const url = window.URL.createObjectURL(blob)
       const anchor = document.createElement('a')
@@ -889,11 +912,110 @@ export function useAnalysis() {
     } finally {
       setIsExporting(false)
     }
-  }, [positions, customerName, projectName, isExporting, projectId, customUnitPrices, alternativeFlags, supplierOpenFlags, buildActiveSelections])
+  }, [positions, customerName, projectName, isExporting, projectId, customUnitPrices, alternativeFlags, supplierOpenFlags, buildActiveSelections, positionDecisions])
 
   const handleExportCancel = useCallback(() => {
     setShowExportDialog(false)
+    setSendOfferResult(null)
   }, [])
+
+  const handlePreviewOfferPdf = useCallback(async () => {
+    if (isPreviewingOfferPdf) return
+    setIsPreviewingOfferPdf(true)
+    const activeSelections = buildActiveSelections()
+    const rejectedPositionIds = Object.entries(positionDecisions)
+      .filter(([, decision]) => decision === 'rejected')
+      .map(([posId]) => posId)
+    try {
+      const blob = await fetchOfferPdfPreview(
+        positions,
+        activeSelections.selectedArticleIds,
+        customerName,
+        projectName,
+        customUnitPrices,
+        alternativeFlags,
+        supplierOpenFlags,
+        activeSelections.assignmentKeysByPosition,
+        projectId,
+        rejectedPositionIds,
+      )
+      const url = window.URL.createObjectURL(blob)
+      const newWin = window.open(url, '_blank', 'noopener')
+      // Revoke after the new tab has had a chance to load; fall back to 60s.
+      window.setTimeout(() => window.URL.revokeObjectURL(url), 60_000)
+      if (!newWin) {
+        setSendOfferResult({ kind: 'error', message: 'Popup-Blocker hat die Vorschau verhindert. Bitte Pop-ups erlauben.' })
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'PDF-Vorschau fehlgeschlagen'
+      setSendOfferResult({ kind: 'error', message })
+    } finally {
+      setIsPreviewingOfferPdf(false)
+    }
+  }, [
+    isPreviewingOfferPdf,
+    positions,
+    customerName,
+    projectName,
+    customUnitPrices,
+    alternativeFlags,
+    supplierOpenFlags,
+    projectId,
+    buildActiveSelections,
+    positionDecisions,
+  ])
+
+  const handleSendOfferEmail = useCallback(async (payload: { customerEmail: string; subject: string; body: string }) => {
+    if (isSendingOfferEmail) return
+    setIsSendingOfferEmail(true)
+    setSendOfferResult(null)
+
+    const activeSelections = buildActiveSelections()
+    const rejectedPositionIds = Object.entries(positionDecisions)
+      .filter(([, decision]) => decision === 'rejected')
+      .map(([posId]) => posId)
+
+    try {
+      const result = await sendOfferEmail(
+        positions,
+        activeSelections.selectedArticleIds,
+        customerName,
+        projectName,
+        payload.customerEmail,
+        payload.subject,
+        payload.body,
+        customUnitPrices,
+        alternativeFlags,
+        supplierOpenFlags,
+        activeSelections.assignmentKeysByPosition,
+        projectId,
+        rejectedPositionIds,
+      )
+      setSendOfferResult({
+        kind: result.sent ? 'success' : 'error',
+        message: result.detail ?? (result.sent ? 'E-Mail versendet.' : 'E-Mail konnte nicht versendet werden.'),
+      })
+      if (projectId && result.saved) {
+        saveSelections(projectId, activeSelections.selectedArticleIds).catch(() => {})
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unbekannter Fehler'
+      setSendOfferResult({ kind: 'error', message })
+    } finally {
+      setIsSendingOfferEmail(false)
+    }
+  }, [
+    isSendingOfferEmail,
+    positions,
+    customerName,
+    projectName,
+    customUnitPrices,
+    alternativeFlags,
+    supplierOpenFlags,
+    projectId,
+    buildActiveSelections,
+    positionDecisions,
+  ])
 
   const handleLoadProject = useCallback(async (loadProjectId: number) => {
     abortRef.current?.abort()
@@ -998,7 +1120,8 @@ export function useAnalysis() {
       const freshDefaults: Record<string, string[]> = {}
       suggestionData.suggestions.forEach((entry) => {
         if (entry.suggestions.length > 0) {
-          freshDefaults[entry.position_id] = [entry.suggestions[0].artikel_id]
+          const fallbackIds = entry.suggestions.filter((s) => s.is_bogen_fallback).map((s) => s.artikel_id)
+          freshDefaults[entry.position_id] = fallbackIds.length > 0 ? fallbackIds : [entry.suggestions[0].artikel_id]
         }
       })
 
@@ -1015,6 +1138,22 @@ export function useAnalysis() {
             const current = merged[entry.position_id]
             if (!current || !current.includes(offerSugg.artikel_id)) {
               merged[entry.position_id] = [offerSugg.artikel_id, ...(current ?? []).filter((id) => id !== offerSugg.artikel_id)]
+            }
+          })
+          // Bogen-Fallback: Wenn für eine Bogen-Position ohne Gradzahl keine
+          // explizite Nutzerauswahl außerhalb der Fallback-Gruppe existiert,
+          // alle 15°/30°/45°-Varianten als Zusatzartikel vorauswählen. Das
+          // deckt leere Auswahlen, Legacy-Defaults und veraltete Auswahlen
+          // aus früheren Matcher-Läufen mit ab.
+          suggestionData.suggestions.forEach((entry) => {
+            const fallbackIds = entry.suggestions.filter((s) => s.is_bogen_fallback).map((s) => s.artikel_id)
+            if (fallbackIds.length === 0) return
+            const fallbackSet = new Set(fallbackIds)
+            const validIds = new Set(entry.suggestions.map((s) => s.artikel_id))
+            const current = merged[entry.position_id] ?? []
+            const userPickedOutside = current.some((id) => validIds.has(id) && !fallbackSet.has(id))
+            if (!userPickedOutside) {
+              merged[entry.position_id] = fallbackIds
             }
           })
           // Drop stored selections that are no longer offered by the matcher — they
@@ -1213,6 +1352,11 @@ export function useAnalysis() {
     handleExportPreview,
     handleExportConfirm,
     handleExportCancel,
+    handleSendOfferEmail,
+    isSendingOfferEmail,
+    sendOfferResult,
+    handlePreviewOfferPdf,
+    isPreviewingOfferPdf,
     handleLoadProject,
     handleReset,
     handleUndo,

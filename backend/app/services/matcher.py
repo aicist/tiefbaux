@@ -1313,15 +1313,21 @@ def _pipe_length_score(required_mm: int | None, product: Product) -> tuple[float
     return -5.0, [f"Baulänge abweichend ({product_len}mm ≠ {required_mm}mm)"]
 
 
+def _extract_product_angle(product: Product) -> int | None:
+    product_text = f"{product.artikelname} {product.artikelbeschreibung or ''}"
+    angle_match = re.search(r"(\d+)\s*(?:°|[Gg]rad)", product_text, re.IGNORECASE)
+    if not angle_match:
+        return None
+    return int(angle_match.group(1))
+
+
 def _angle_score(required_deg: int | None, product: Product) -> tuple[float, list[str]]:
     """Score based on fitting angle match (e.g. 45° Bogen)."""
     if required_deg is None:
         return 0.0, []
-    product_text = f"{product.artikelname} {product.artikelbeschreibung or ''}"
-    angle_match = re.search(r"(\d+)\s*(?:°|[Gg]rad)", product_text, re.IGNORECASE)
-    if not angle_match:
+    product_angle = _extract_product_angle(product)
+    if product_angle is None:
         return 0.0, []
-    product_angle = int(angle_match.group(1))
     if product_angle == required_deg:
         return 10.0, [f"Winkel {required_deg}° exakt"]
     return -15.0, [f"Winkel abweichend ({product_angle}° ≠ {required_deg}°)"]
@@ -1710,6 +1716,7 @@ def suggest_products_for_position(
             (product.hersteller or "").strip().lower(),
             product.nennweite_dn,
             (product.steifigkeitsklasse_sn or "").strip().lower(),
+            _extract_product_angle(product),
         )
         if family_key in family_seen:
             idx = family_seen[family_key]
@@ -1736,7 +1743,28 @@ def suggest_products_for_position(
         family_seen[family_key] = len(deduped)
         deduped.append(entry)
 
-    final_candidates = deduped[:limit]
+    # Bogen-Fallback: Wenn keine Gradzahl im LV genannt ist, schlägt Fassbender
+    # standardmäßig 15°/30°/45°-Varianten vor. Wir wählen pro Winkel die
+    # bestplatzierte Variante aus und markieren sie als Zusatzartikel, damit
+    # das Frontend alle drei automatisch auswählen kann (gemeinsames Angebot).
+    bogen_fallback_ids: set[str] = set()
+    if position_product_type == "bogen" and position.parameters.angle_deg is None:
+        fallback_angles = (15, 30, 45)
+        picks_by_angle: dict[int, tuple] = {}
+        for entry in deduped:
+            _, product, reasons, _ = entry
+            angle = _extract_product_angle(product)
+            if angle is None or angle not in fallback_angles:
+                continue
+            if angle in picks_by_angle:
+                continue
+            reasons.insert(0, f"Zusatzartikel {angle}° (Gradzahl im LV nicht genannt)")
+            picks_by_angle[angle] = entry
+        if picks_by_angle:
+            deduped = [picks_by_angle[a] for a in fallback_angles if a in picks_by_angle]
+            bogen_fallback_ids = {entry[1].artikel_id for entry in deduped}
+
+    final_candidates = deduped[: max(limit, len(bogen_fallback_ids))]
 
     # Feature 6: Inject manual override suggestions
     override_suggestions: list[ProductSuggestion] = []
@@ -1763,6 +1791,8 @@ def suggest_products_for_position(
             sn=sn_val,
             load_class=ov_product.belastungsklasse,
             norm=ov_product.norm_primaer,
+            material=ov_product.werkstoff,
+            angle_deg=_extract_product_angle(ov_product),
             stock=ov_product.lager_gesamt,
             delivery_days=ov_product.lieferant_1_lieferzeit_tage,
             price_net=unit_price,
@@ -1806,6 +1836,8 @@ def suggest_products_for_position(
                 sn=int(re.search(r"(\d+)", product.steifigkeitsklasse_sn).group(1)) if product.steifigkeitsklasse_sn and re.search(r"(\d+)", product.steifigkeitsklasse_sn) else None,
                 load_class=product.belastungsklasse,
                 norm=product.norm_primaer,
+                material=product.werkstoff,
+                angle_deg=_extract_product_angle(product),
                 stock=product.lager_gesamt,
                 delivery_days=product.lieferant_1_lieferzeit_tage,
                 price_net=unit_price,
@@ -1813,6 +1845,7 @@ def suggest_products_for_position(
                 currency=product.waehrung or "EUR",
                 score=round(s, 2),
                 reasons=deduped_reasons,
+                is_bogen_fallback=product.artikel_id in bogen_fallback_ids,
                 warnings=suggestion_warnings,
                 score_breakdown=breakdown,
             )

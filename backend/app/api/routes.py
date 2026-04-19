@@ -17,13 +17,16 @@ from sqlalchemy.orm import Session, load_only, selectinload
 
 from ..auth import get_current_user, require_admin
 from ..database import get_db
-from ..models import LVProject, LVProjectPosition, ManualOverride, Product, ProjectFile, Supplier, SupplierInquiry, SupplierOffer, Tender, User
+from ..models import InboundEmailEvent, Kunde, LVProject, LVProjectPosition, ManualOverride, Objekt, Product, ProjectFile, Supplier, SupplierInquiry, SupplierOffer, Tender, User
 from ..schemas import (
     ComponentSuggestions,
     DuplicateInfo,
     ExportOfferRequest,
     ExportPreviewResponse,
     ExportWarning,
+    OfferEmailDefaults,
+    SendOfferEmailRequest,
+    SendOfferEmailResponse,
     HealthResponse,
     InquiryBatchCreateRequest,
     InquiryCreateRequest,
@@ -42,6 +45,13 @@ from ..schemas import (
     ProductSearchResult,
     ProductSearchResponse,
     ProductSuggestion,
+    KundenOrdnerSummary,
+    KundenProjektListResponse,
+    KundeUpdate,
+    ObjektDetailResponse,
+    ObjektSummary,
+    ObjektUpdate,
+    ProjectUpdate,
     ProjectDetailResponse,
     ProjectMetadata,
     ProjectSummary,
@@ -65,6 +75,7 @@ from ..services.ai_interpreter import _infer_with_heuristics, enrich_positions_w
 from ..services.llm_parser import _inherit_reference_context, _merge_heuristic_parameters, finalize_position_descriptions, parse_lv_with_llm
 from ..services.matcher import _description_hash, load_active_products, suggest_products_for_component, suggest_products_for_position
 from ..services.inbound_email_service import get_sync_status as get_inbox_sync_status, sync_inbound_mailbox
+from ..services.email_service import build_offer_email, send_email
 from ..services.offer_export import build_offer_pdf, now_metadata
 from ..services.pdf_parser import extract_positions_from_pdf
 
@@ -457,18 +468,62 @@ def _store_project(
     positions: list[LVPosition],
     metadata: ProjectMetadata | None = None,
     pdf_path: str | None = None,
+    sender_email: str | None = None,
+    anfrage_art: str = "submission",
 ) -> LVProject:
-    """Persist parsed LV positions to the database."""
+    """Persist parsed LV positions to the database.
+
+    Resolves or creates the Objekt (aus bauvorhaben/objekt_nr/auftraggeber) und
+    den Kunden (aus sender_email oder kunde_name). Wenn für dasselbe Objekt
+    bereits ein anderes Kundenprojekt mit identischem content_hash existiert,
+    werden dessen selections_json/workstate_json übernommen.
+    """
+    from ..services.archive_resolvers import (
+        resolve_or_create_objekt,
+        resolve_or_create_kunde,
+        find_shareable_project,
+    )
+
     billable = sum(1 for p in positions if p.billable)
     service = sum(1 for p in positions if p.position_type == "dienstleistung")
 
+    bauvorhaben = metadata.bauvorhaben if metadata else None
+    objekt_nr = metadata.objekt_nr if metadata else None
+    auftraggeber = metadata.auftraggeber if metadata else None
+    submission_date = metadata.submission_date if metadata else None
+    kunde_name = metadata.kunde_name if metadata else None
+    kunde_adresse = metadata.kunde_adresse if metadata else None
+
+    objekt = resolve_or_create_objekt(
+        db,
+        bauvorhaben=bauvorhaben,
+        objekt_nr=objekt_nr,
+        auftraggeber=auftraggeber,
+        submission_date=submission_date,
+    )
+    kunde = resolve_or_create_kunde(
+        db,
+        name=kunde_name or auftraggeber,
+        sender_email=sender_email,
+        address=kunde_adresse,
+    )
+
+    shareable = find_shareable_project(
+        db,
+        objekt_id=objekt.id,
+        content_hash=content_hash,
+    )
+
     project = LVProject(
         content_hash=content_hash,
+        objekt_id=objekt.id,
+        kunde_id=kunde.id,
         filename=filename,
         total_positions=len(positions),
         billable_positions=billable,
         service_positions=service,
         pdf_path=pdf_path,
+        anfrage_art=anfrage_art,
     )
     if metadata:
         project.bauvorhaben = metadata.bauvorhaben
@@ -477,6 +532,13 @@ def _store_project(
         project.auftraggeber = metadata.auftraggeber
         project.kunde_name = metadata.kunde_name
         project.kunde_adresse = metadata.kunde_adresse
+
+    if shareable is not None:
+        # Shared Kalkulation: gleicher LV-Inhalt unter gleichem Objekt für einen
+        # anderen Kunden → Auswahl und Workstate übernehmen, damit die
+        # Kundenordner dieselbe Zuordnung zeigen.
+        project.selections_json = shareable.selections_json
+        project.workstate_json = shareable.workstate_json
 
     db.add(project)
     db.flush()
@@ -517,7 +579,14 @@ def _store_project(
 
 
 @router.post("/parse-lv", response_model=ParseLVResponse)
-async def parse_lv(file: UploadFile = File(...), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> ParseLVResponse:
+async def parse_lv(
+    file: UploadFile = File(...),
+    anfrage_art: str = "submission",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ParseLVResponse:
+    if anfrage_art not in ("submission", "bedarf"):
+        raise HTTPException(status_code=400, detail="anfrage_art muss 'submission' oder 'bedarf' sein")
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded")
 
@@ -530,8 +599,15 @@ async def parse_lv(file: UploadFile = File(...), db: Session = Depends(get_db), 
 
     content_hash = hashlib.sha256(pdf_bytes).hexdigest()
 
-    # Check for existing analysis
-    existing = db.scalar(select(LVProject).where(LVProject.content_hash == content_hash))
+    # Check for existing analysis — Duplikate werden jetzt pro (Objekt, Kunde)
+    # erkannt; derselbe Hash unter einem anderen Kunden erzeugt einen neuen
+    # Kundenordner und übernimmt (in _store_project) die Kalkulation.
+    existing = db.scalar(
+        select(LVProject).where(
+            LVProject.content_hash == content_hash,
+            LVProject.anfrage_art == anfrage_art,
+        )
+    )
     if existing:
         logger.info("Duplicate LV detected (hash=%s, project_id=%d)", content_hash[:12], existing.id)
         # Ensure long-term PDF availability in serverless environments.
@@ -603,7 +679,7 @@ async def parse_lv(file: UploadFile = File(...), db: Session = Depends(get_db), 
 
     # Store for future duplicate detection
     try:
-        project = _store_project(db, content_hash, file.filename, positions, metadata, stored_pdf_path)
+        project = _store_project(db, content_hash, file.filename, positions, metadata, stored_pdf_path, anfrage_art=anfrage_art)
         _upsert_project_file(
             db,
             project_id=project.id,
@@ -829,9 +905,12 @@ def _build_offer_lines(
                 supplier_offer_text_by_position[position_id] = product_description
     lines: list[OfferLine] = []
     warnings: list[ExportWarning] = []
+    rejected_position_ids = set(request.rejected_position_ids or [])
 
-    # Check for material positions without article assignment (skip Dienstleistungen)
+    # Check for material positions without article assignment (skip Dienstleistungen + abgelehnte)
     for position in request.positions:
+        if position.id in rejected_position_ids:
+            continue
         art_ids = request.selected_article_ids.get(position.id, [])
         if not art_ids and position.position_type != "dienstleistung":
             warnings.append(ExportWarning(
@@ -964,9 +1043,12 @@ def _validate_offer_export_requirements(request: ExportOfferRequest, db: Session
 
     selected_by_position = request.selected_article_ids or {}
     assignment_keys_by_position = request.assignment_keys_by_position or {}
+    rejected_position_ids = set(request.rejected_position_ids or [])
 
     for position in request.positions:
         if not position.billable or position.position_type == "dienstleistung":
+            continue
+        if position.id in rejected_position_ids:
             continue
 
         selected_ids = selected_by_position.get(position.id, [])
@@ -996,6 +1078,46 @@ def _validate_offer_export_requirements(request: ExportOfferRequest, db: Session
                 )
 
 
+def _resolve_customer_email_hint(project_id: int | None, db: Session) -> str | None:
+    """Best-effort lookup of the customer's email for a project, prefilled in the dialog.
+
+    Tries the latest inbound email event whose sender matches the project's
+    Kunde email_domain. Returns None if nothing suitable is found.
+    """
+    if not project_id:
+        return None
+    project = db.get(LVProject, project_id)
+    if project is None or project.kunde_id is None:
+        return None
+    kunde = db.get(Kunde, project.kunde_id)
+    if kunde is None or not kunde.email_domain:
+        return None
+    row = db.execute(
+        select(InboundEmailEvent.sender)
+        .where(InboundEmailEvent.sender.ilike(f"%@{kunde.email_domain}"))
+        .order_by(InboundEmailEvent.processed_at.desc())
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    sender = row[0]
+    return sender or None
+
+
+def _build_email_defaults(request: ExportOfferRequest, total_net: float, line_count: int, db: Session) -> OfferEmailDefaults:
+    subject, body = build_offer_email(
+        project_name=request.project_name,
+        customer_name=request.customer_name,
+        total_net=round(total_net, 2),
+        line_count=line_count,
+    )
+    return OfferEmailDefaults(
+        customer_email=_resolve_customer_email_hint(request.project_id, db),
+        subject=subject,
+        body=body,
+    )
+
+
 @router.post("/export-preview", response_model=ExportPreviewResponse)
 def export_preview(request: ExportOfferRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> ExportPreviewResponse:
     _validate_offer_export_requirements(request, db)
@@ -1006,6 +1128,7 @@ def export_preview(request: ExportOfferRequest, db: Session = Depends(get_db), c
         total_count=len(request.positions),
         skipped_positions=warnings,
         total_net=round(total_net, 2),
+        email_defaults=_build_email_defaults(request, total_net, len(lines), db),
     )
 
 
@@ -1052,6 +1175,95 @@ def export_offer(request: ExportOfferRequest, db: Session = Depends(get_db), cur
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.post("/export-offer/preview-pdf")
+def export_offer_preview_pdf(
+    request: ExportOfferRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> StreamingResponse:
+    """Generate the offer PDF for preview without persisting or updating status."""
+    _validate_offer_export_requirements(request, db)
+    lines, _warnings = _build_offer_lines(request, db)
+    if not lines:
+        raise HTTPException(status_code=400, detail="Keine gültigen Artikel für den Export ausgewählt")
+
+    total_net = sum(line.total_net for line in lines)
+    metadata = now_metadata(request.customer_name, request.project_name, total_net, request.customer_address)
+    pdf_bytes = build_offer_pdf(lines, metadata)
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'inline; filename="angebot-vorschau.pdf"'},
+    )
+
+
+def _persist_offer_pdf(project_id: int, pdf_bytes: bytes, current_user: User, db: Session) -> None:
+    project = db.get(LVProject, project_id)
+    if not project:
+        return
+    try:
+        offers_dir = _offers_runtime_dir(project_id)
+        offers_dir.mkdir(parents=True, exist_ok=True)
+        (offers_dir / "angebot.pdf").write_bytes(pdf_bytes)
+    except Exception as exc:
+        logger.warning("Failed to persist offer PDF on filesystem (project_id=%s): %s", project_id, exc)
+    project.offer_pdf_path = str(Path("offers") / str(project_id) / "angebot.pdf")
+    _upsert_project_file(
+        db,
+        project_id=project.id,
+        kind="offer",
+        filename=f"angebot-{project.projekt_nr or project.id}.pdf",
+        content=pdf_bytes,
+    )
+    project.status = "gerechnet"
+    _touch_project_editor(project, current_user)
+    db.commit()
+
+
+@router.post("/export-offer/send-email", response_model=SendOfferEmailResponse)
+def export_offer_send_email(
+    request: SendOfferEmailRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> SendOfferEmailResponse:
+    recipient = (request.customer_email or "").strip()
+    if "@" not in recipient:
+        raise HTTPException(status_code=400, detail="Ungültige Empfänger-E-Mail-Adresse.")
+    if not (request.email_subject or "").strip():
+        raise HTTPException(status_code=400, detail="Betreff darf nicht leer sein.")
+    if not (request.email_body or "").strip():
+        raise HTTPException(status_code=400, detail="Nachrichtentext darf nicht leer sein.")
+
+    _validate_offer_export_requirements(request, db)
+    lines, _warnings = _build_offer_lines(request, db)
+    if not lines:
+        raise HTTPException(status_code=400, detail="Keine gültigen Artikel für den Export ausgewählt")
+
+    total_net = sum(line.total_net for line in lines)
+    metadata = now_metadata(request.customer_name, request.project_name, total_net, request.customer_address)
+    pdf_bytes = build_offer_pdf(lines, metadata)
+
+    saved = False
+    if request.project_id:
+        _persist_offer_pdf(request.project_id, pdf_bytes, current_user, db)
+        saved = True
+
+    project_ref = request.project_name or "Angebot"
+    attachment_name = f"angebot-{project_ref}.pdf".replace(" ", "_")
+    sent = send_email(
+        recipient,
+        request.email_subject.strip(),
+        request.email_body,
+        attachments=[(attachment_name, pdf_bytes)],
+    )
+    detail = (
+        "Angebot erfolgreich per E-Mail versendet."
+        if sent
+        else "SMTP ist nicht konfiguriert — das Angebot wurde gespeichert, aber nicht versendet."
+    )
+    return SendOfferEmailResponse(sent=sent, saved=saved, detail=detail)
 
 
 @router.get("/products/search", response_model=ProductSearchResponse)
@@ -1135,6 +1347,7 @@ def _project_to_summary(p: LVProject, has_pending_inquiries: bool = False) -> Pr
         submission_date=p.submission_date,
         kunde_name=p.kunde_name,
         status=effective_status,
+        anfrage_art=p.anfrage_art or "submission",
         offer_pdf_path=p.offer_pdf_path,
         assigned_user_name=p.assigned_user.name if p.assigned_user else None,
         last_editor_name=p.last_editor.name if p.last_editor else None,
@@ -1162,6 +1375,7 @@ def list_projects(q: str = "", db: Session = Depends(get_db), current_user: User
                 LVProject.submission_date,
                 LVProject.kunde_name,
                 LVProject.status,
+                LVProject.anfrage_art,
                 LVProject.offer_pdf_path,
                 LVProject.assigned_user_id,
                 LVProject.last_editor_id,
@@ -1195,6 +1409,202 @@ def list_projects(q: str = "", db: Session = Depends(get_db), current_user: User
         pending_map = {int(project_id): int(count) for project_id, count in pending_rows if project_id is not None}
 
     return [_project_to_summary(p, has_pending_inquiries=pending_map.get(p.id, 0) > 0) for p in projects]
+
+
+def _objekt_to_summary(
+    objekt: Objekt,
+    *,
+    kunden_count: int,
+    project_count: int,
+    latest_created_at: datetime | None,
+) -> ObjektSummary:
+    return ObjektSummary(
+        id=objekt.id,
+        slug=objekt.slug,
+        bauvorhaben=objekt.bauvorhaben,
+        objekt_nr=objekt.objekt_nr,
+        auftraggeber=objekt.auftraggeber,
+        submission_date=objekt.submission_date,
+        created_at=objekt.created_at,
+        kunden_count=kunden_count,
+        project_count=project_count,
+        latest_project_created_at=latest_created_at,
+    )
+
+
+def _kunde_to_ordner_summary(
+    kunde: Kunde,
+    *,
+    project_count: int,
+    latest_created_at: datetime | None,
+) -> KundenOrdnerSummary:
+    return KundenOrdnerSummary(
+        kunde_id=kunde.id,
+        slug=kunde.slug,
+        name=kunde.name,
+        display_name=kunde.display_name,
+        email_domain=kunde.email_domain,
+        project_count=project_count,
+        latest_project_created_at=latest_created_at,
+    )
+
+
+@router.get("/objekte", response_model=list[ObjektSummary])
+def list_objekte(
+    q: str = "",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[ObjektSummary]:
+    """List all Objekte with aggregated Kunden/Projekt counts."""
+    query = select(Objekt)
+    if q:
+        like_q = f"%{q}%"
+        query = query.where(
+            Objekt.bauvorhaben.ilike(like_q)
+            | Objekt.auftraggeber.ilike(like_q)
+            | Objekt.objekt_nr.ilike(like_q)
+        )
+    objekte = db.scalars(query).all()
+    if not objekte:
+        return []
+    objekt_ids = [o.id for o in objekte]
+    stats_rows = db.execute(
+        select(
+            LVProject.objekt_id,
+            func.count(func.distinct(LVProject.kunde_id)),
+            func.count(LVProject.id),
+            func.max(LVProject.created_at),
+        )
+        .where(LVProject.objekt_id.in_(objekt_ids))
+        .group_by(LVProject.objekt_id)
+    ).all()
+    stats = {
+        int(oid): (int(kc or 0), int(pc or 0), lm)
+        for oid, kc, pc, lm in stats_rows
+        if oid is not None
+    }
+    summaries = []
+    for o in objekte:
+        kc, pc, lm = stats.get(o.id, (0, 0, None))
+        summaries.append(_objekt_to_summary(o, kunden_count=kc, project_count=pc, latest_created_at=lm))
+    summaries.sort(key=lambda s: s.latest_project_created_at or s.created_at, reverse=True)
+    return summaries
+
+
+@router.get("/objekte/{objekt_id}", response_model=ObjektDetailResponse)
+def get_objekt(
+    objekt_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ObjektDetailResponse:
+    objekt = db.get(Objekt, objekt_id)
+    if not objekt:
+        raise HTTPException(status_code=404, detail="Objekt nicht gefunden")
+
+    rows = db.execute(
+        select(
+            Kunde,
+            func.count(LVProject.id),
+            func.max(LVProject.created_at),
+        )
+        .join(LVProject, LVProject.kunde_id == Kunde.id)
+        .where(LVProject.objekt_id == objekt_id)
+        .group_by(Kunde.id)
+    ).all()
+    kunden_summaries = [
+        _kunde_to_ordner_summary(k, project_count=int(pc or 0), latest_created_at=lm)
+        for k, pc, lm in rows
+    ]
+    kunden_summaries.sort(key=lambda k: k.latest_project_created_at or datetime.min, reverse=True)
+
+    total_projects = sum(k.project_count for k in kunden_summaries)
+    latest = max((k.latest_project_created_at for k in kunden_summaries if k.latest_project_created_at), default=None)
+
+    return ObjektDetailResponse(
+        objekt=_objekt_to_summary(
+            objekt,
+            kunden_count=len(kunden_summaries),
+            project_count=total_projects,
+            latest_created_at=latest,
+        ),
+        kunden=kunden_summaries,
+    )
+
+
+@router.get("/objekte/{objekt_id}/kunden/{kunde_id}/projects", response_model=KundenProjektListResponse)
+def list_projects_for_kunde(
+    objekt_id: int,
+    kunde_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> KundenProjektListResponse:
+    objekt = db.get(Objekt, objekt_id)
+    if not objekt:
+        raise HTTPException(status_code=404, detail="Objekt nicht gefunden")
+    kunde = db.get(Kunde, kunde_id)
+    if not kunde:
+        raise HTTPException(status_code=404, detail="Kunde nicht gefunden")
+
+    projects = db.scalars(
+        select(LVProject)
+        .options(
+            load_only(
+                LVProject.id,
+                LVProject.filename,
+                LVProject.project_name,
+                LVProject.projekt_nr,
+                LVProject.total_positions,
+                LVProject.billable_positions,
+                LVProject.service_positions,
+                LVProject.created_at,
+                LVProject.bauvorhaben,
+                LVProject.objekt_nr,
+                LVProject.submission_date,
+                LVProject.kunde_name,
+                LVProject.status,
+                LVProject.anfrage_art,
+                LVProject.offer_pdf_path,
+                LVProject.assigned_user_id,
+                LVProject.last_editor_id,
+                LVProject.last_edited_at,
+            ),
+            selectinload(LVProject.assigned_user).load_only(User.id, User.name),
+            selectinload(LVProject.last_editor).load_only(User.id, User.name),
+        )
+        .where(LVProject.objekt_id == objekt_id, LVProject.kunde_id == kunde_id)
+        .order_by(LVProject.created_at.desc())
+    ).all()
+
+    pending_map: dict[int, int] = {}
+    if projects:
+        pending_rows = db.execute(
+            select(SupplierInquiry.project_id, func.count())
+            .where(SupplierInquiry.project_id.in_([p.id for p in projects]))
+            .where(SupplierInquiry.status.in_(PENDING_INQUIRY_STATUSES))
+            .group_by(SupplierInquiry.project_id)
+        ).all()
+        pending_map = {int(pid): int(c) for pid, c in pending_rows if pid is not None}
+
+    project_summaries = [
+        _project_to_summary(p, has_pending_inquiries=pending_map.get(p.id, 0) > 0)
+        for p in projects
+    ]
+    latest = projects[0].created_at if projects else None
+
+    return KundenProjektListResponse(
+        objekt=_objekt_to_summary(
+            objekt,
+            kunden_count=0,
+            project_count=len(projects),
+            latest_created_at=latest,
+        ),
+        kunde=_kunde_to_ordner_summary(
+            kunde,
+            project_count=len(projects),
+            latest_created_at=latest,
+        ),
+        projects=project_summaries,
+    )
 
 
 @router.get("/projects/{project_id}", response_model=ProjectDetailResponse)
@@ -1259,43 +1669,50 @@ def get_project(project_id: int, db: Session = Depends(get_db), current_user: Us
     )
 
 
+def _purge_project_dependencies(db: Session, project: LVProject) -> list[Path]:
+    """Remove dependent rows for a project and return filesystem paths to delete after commit.
+
+    Does NOT delete the project itself or commit — caller does that so Objekt/Kunde
+    cascade can purge many projects in a single transaction.
+    """
+    resolved_project_pdf = _resolve_stored_file_path(project.pdf_path, kind="upload")
+    resolved_offer_pdf = _resolve_stored_file_path(project.offer_pdf_path, kind="offer", project_id=project.id)
+
+    inquiry_ids = db.execute(
+        select(SupplierInquiry.id).where(SupplierInquiry.project_id == project.id)
+    ).scalars().all()
+    if inquiry_ids:
+        db.execute(delete(SupplierOffer).where(SupplierOffer.inquiry_id.in_(inquiry_ids)))
+    db.execute(delete(SupplierOffer).where(SupplierOffer.project_id == project.id))
+    db.execute(delete(SupplierInquiry).where(SupplierInquiry.project_id == project.id))
+    db.execute(
+        update(Tender).where(Tender.project_id == project.id).values(project_id=None)
+    )
+    db.execute(delete(ProjectFile).where(ProjectFile.project_id == project.id))
+
+    paths: list[Path] = []
+    for p in (resolved_project_pdf, resolved_offer_pdf):
+        if p:
+            paths.append(p)
+    return paths
+
+
+def _cleanup_paths(paths: list[Path]) -> None:
+    for file_path in paths:
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("Failed to remove file %s: %s", file_path, exc)
+
+
 @router.delete("/projects/{project_id}")
 def delete_project(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     project = db.get(LVProject, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Projekt nicht gefunden")
 
-    # Resolve file paths before rows are deleted.
-    resolved_project_pdf = _resolve_stored_file_path(project.pdf_path, kind="upload")
-    resolved_offer_pdf = _resolve_stored_file_path(project.offer_pdf_path, kind="offer", project_id=project.id)
-
     try:
-        # Remove dependent records not covered by ORM cascade on LVProject.
-        inquiry_ids = db.execute(
-            select(SupplierInquiry.id).where(SupplierInquiry.project_id == project_id)
-        ).scalars().all()
-
-        if inquiry_ids:
-            db.execute(
-                delete(SupplierOffer).where(SupplierOffer.inquiry_id.in_(inquiry_ids))
-            )
-
-        db.execute(
-            delete(SupplierOffer).where(SupplierOffer.project_id == project_id)
-        )
-        db.execute(
-            delete(SupplierInquiry).where(SupplierInquiry.project_id == project_id)
-        )
-        # Keep tenders but unlink deleted project reference.
-        db.execute(
-            update(Tender)
-            .where(Tender.project_id == project_id)
-            .values(project_id=None)
-        )
-        db.execute(
-            delete(ProjectFile).where(ProjectFile.project_id == project_id)
-        )
-
+        file_paths = _purge_project_dependencies(db, project)
         db.delete(project)
         db.commit()
     except IntegrityError as exc:
@@ -1306,16 +1723,132 @@ def delete_project(project_id: int, db: Session = Depends(get_db), current_user:
             detail="Projekt konnte nicht gelöscht werden (verknüpfte Daten).",
         )
 
-    # Cleanup files best-effort (DB delete already committed).
-    for file_path in (resolved_project_pdf, resolved_offer_pdf):
-        if not file_path:
-            continue
-        try:
-            file_path.unlink(missing_ok=True)
-        except Exception as exc:
-            logger.warning("Failed to remove project file %s: %s", file_path, exc)
-
+    _cleanup_paths(file_paths)
     return {"ok": True}
+
+
+@router.patch("/objekte/{objekt_id}", response_model=ObjektSummary)
+def update_objekt(
+    objekt_id: int,
+    payload: ObjektUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ObjektSummary:
+    objekt = db.get(Objekt, objekt_id)
+    if not objekt:
+        raise HTTPException(status_code=404, detail="Objekt nicht gefunden")
+    data = payload.model_dump(exclude_unset=True)
+    for field, value in data.items():
+        setattr(objekt, field, value)
+    db.commit()
+    db.refresh(objekt)
+
+    stats_row = db.execute(
+        select(
+            func.count(func.distinct(LVProject.kunde_id)),
+            func.count(LVProject.id),
+            func.max(LVProject.created_at),
+        ).where(LVProject.objekt_id == objekt_id)
+    ).one()
+    return _objekt_to_summary(
+        objekt,
+        kunden_count=int(stats_row[0] or 0),
+        project_count=int(stats_row[1] or 0),
+        latest_created_at=stats_row[2],
+    )
+
+
+@router.delete("/objekte/{objekt_id}")
+def delete_objekt(objekt_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    objekt = db.get(Objekt, objekt_id)
+    if not objekt:
+        raise HTTPException(status_code=404, detail="Objekt nicht gefunden")
+    projects = db.scalars(select(LVProject).where(LVProject.objekt_id == objekt_id)).all()
+    try:
+        file_paths: list[Path] = []
+        for project in projects:
+            file_paths.extend(_purge_project_dependencies(db, project))
+            db.delete(project)
+        db.delete(objekt)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        logger.warning("Failed to delete objekt %s: %s", objekt_id, exc)
+        raise HTTPException(status_code=409, detail="Objekt konnte nicht gelöscht werden (verknüpfte Daten).")
+    _cleanup_paths(file_paths)
+    return {"ok": True, "deleted_projects": len(projects)}
+
+
+@router.patch("/kunden/{kunde_id}", response_model=KundenOrdnerSummary)
+def update_kunde(
+    kunde_id: int,
+    payload: KundeUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> KundenOrdnerSummary:
+    kunde = db.get(Kunde, kunde_id)
+    if not kunde:
+        raise HTTPException(status_code=404, detail="Kunde nicht gefunden")
+    data = payload.model_dump(exclude_unset=True)
+    for field, value in data.items():
+        setattr(kunde, field, value)
+    db.commit()
+    db.refresh(kunde)
+
+    stats_row = db.execute(
+        select(func.count(LVProject.id), func.max(LVProject.created_at))
+        .where(LVProject.kunde_id == kunde_id)
+    ).one()
+    return _kunde_to_ordner_summary(
+        kunde,
+        project_count=int(stats_row[0] or 0),
+        latest_created_at=stats_row[1],
+    )
+
+
+@router.delete("/kunden/{kunde_id}")
+def delete_kunde(kunde_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    kunde = db.get(Kunde, kunde_id)
+    if not kunde:
+        raise HTTPException(status_code=404, detail="Kunde nicht gefunden")
+    projects = db.scalars(select(LVProject).where(LVProject.kunde_id == kunde_id)).all()
+    try:
+        file_paths: list[Path] = []
+        for project in projects:
+            file_paths.extend(_purge_project_dependencies(db, project))
+            db.delete(project)
+        db.delete(kunde)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        logger.warning("Failed to delete kunde %s: %s", kunde_id, exc)
+        raise HTTPException(status_code=409, detail="Kunde konnte nicht gelöscht werden (verknüpfte Daten).")
+    _cleanup_paths(file_paths)
+    return {"ok": True, "deleted_projects": len(projects)}
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectSummary)
+def update_project(
+    project_id: int,
+    payload: ProjectUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ProjectSummary:
+    project = db.get(LVProject, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Projekt nicht gefunden")
+    data = payload.model_dump(exclude_unset=True)
+    for field, value in data.items():
+        setattr(project, field, value)
+    _touch_project_editor(project, current_user)
+    db.commit()
+    db.refresh(project)
+    has_pending = db.scalar(
+        select(func.count(SupplierInquiry.id))
+        .where(SupplierInquiry.project_id == project.id)
+        .where(SupplierInquiry.status.in_(PENDING_INQUIRY_STATUSES))
+    ) or 0
+    return _project_to_summary(project, has_pending_inquiries=has_pending > 0)
 
 
 @router.post("/projects/save-selections")

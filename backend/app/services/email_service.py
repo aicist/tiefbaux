@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import smtplib
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from ..config import settings
@@ -192,8 +194,53 @@ Mit freundlichen Grüßen,
     return subject, body
 
 
-def send_email(to_email: str, subject: str, body: str) -> bool:
-    """Send an email via SMTP. Returns True if sent, False if SMTP not configured."""
+def build_offer_email(
+    project_name: str | None,
+    customer_name: str | None,
+    total_net: float | None,
+    line_count: int | None = None,
+) -> tuple[str, str]:
+    """Build a default subject/body for an outgoing offer email to the customer."""
+    project_label = (project_name or "").strip() or "Ihr Projekt"
+    subject = f"Angebot: {project_label}"
+
+    greeting_name = (customer_name or "").strip()
+    greeting = f"Sehr geehrte Damen und Herren von {greeting_name}," if greeting_name else "Sehr geehrte Damen und Herren,"
+
+    total_line = ""
+    if total_net is not None:
+        total_line = f"\nNetto-Gesamtsumme: {total_net:,.2f} EUR".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    count_line = ""
+    if line_count:
+        count_line = f"\nEnthaltene Positionen: {line_count}"
+
+    body = f"""{greeting}
+
+vielen Dank für Ihre Anfrage zum Projekt "{project_label}".
+Anbei erhalten Sie unser Angebot als PDF im Anhang.{count_line}{total_line}
+
+Für Rückfragen stehen wir gerne zur Verfügung.
+
+Mit freundlichen Grüßen,
+{settings.smtp_from_name}
+"""
+    return subject, body
+
+
+def send_email(
+    to_email: str,
+    subject: str,
+    body: str,
+    attachments: list[tuple[str, bytes]] | None = None,
+) -> bool:
+    """Send an email via SMTP. Returns True if sent, False if SMTP not configured.
+
+    ``attachments`` is a list of ``(filename, content_bytes)`` tuples. When set,
+    the email is sent as ``multipart/mixed`` with each entry as a PDF-style
+    application attachment (octet-stream fallback when the filename has no
+    recognizable extension).
+    """
 
     effective_recipients = [to_email]
     effective_subject = subject
@@ -219,7 +266,16 @@ def send_email(to_email: str, subject: str, body: str) -> bool:
         )
         return False
 
-    msg = MIMEText(body, "plain", "utf-8")
+    if attachments:
+        msg: MIMEText | MIMEMultipart = MIMEMultipart("mixed")
+        msg.attach(MIMEText(effective_body, "plain", "utf-8"))
+        for filename, content in attachments:
+            subtype = "pdf" if filename.lower().endswith(".pdf") else "octet-stream"
+            part = MIMEApplication(content, _subtype=subtype)
+            part.add_header("Content-Disposition", "attachment", filename=filename)
+            msg.attach(part)
+    else:
+        msg = MIMEText(effective_body, "plain", "utf-8")
     msg["Subject"] = effective_subject
     msg["From"] = f"{settings.smtp_from_name} <{settings.smtp_from_email}>"
     msg["To"] = ", ".join(effective_recipients)

@@ -376,14 +376,17 @@ export function SuggestionsPanel({
                   )}
 
                   {filteredReasons.length > 0 && (
-                    <div className="reason-chips">
-                      {filteredReasons.map((reason) => {
-                        const isNegative = reason.includes('abweichend') || reason.includes('weicht ab') || reason.includes('unter ') || reason.includes('≠')
-                        return (
-                          <span key={reason} className={`reason-chip ${isNegative ? 'reason-negative' : ''}`}>{reason}</span>
-                        )
-                      })}
-                    </div>
+                    <details className="reason-details" onClick={e => e.stopPropagation()}>
+                      <summary className="reason-details-summary">Matching-Details</summary>
+                      <div className="reason-chips">
+                        {filteredReasons.map((reason) => {
+                          const isNegative = reason.includes('abweichend') || reason.includes('weicht ab') || reason.includes('unter ') || reason.includes('≠')
+                          return (
+                            <span key={reason} className={`reason-chip ${isNegative ? 'reason-negative' : ''}`}>{reason}</span>
+                          )
+                        })}
+                      </div>
+                    </details>
                   )}
                 </div>
 

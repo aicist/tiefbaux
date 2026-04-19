@@ -22,7 +22,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import InboundEmailEvent, LVProject, LVProjectPosition, ProjectFile, Supplier, SupplierInquiry, SupplierOffer
+from ..models import InboundEmailEvent, Kunde, LVProject, LVProjectPosition, ProjectFile, Supplier, SupplierInquiry, SupplierOffer
 from ..schemas import LVPosition, ProjectMetadata
 from .ai_interpreter import _infer_with_heuristics, enrich_positions_with_parameters
 from .llm_parser import _inherit_reference_context, _merge_heuristic_parameters, finalize_position_descriptions, parse_lv_with_llm
@@ -407,11 +407,48 @@ def _store_new_project(
     metadata: ProjectMetadata | None,
     pdf_path: str | None,
     fallback_project_name: str | None = None,
+    sender_email: str | None = None,
+    anfrage_art: str = "submission",
 ) -> LVProject:
+    from .archive_resolvers import (
+        resolve_or_create_objekt,
+        resolve_or_create_kunde,
+        find_shareable_project,
+    )
+
     billable = sum(1 for p in positions if p.billable)
     service = sum(1 for p in positions if p.position_type == "dienstleistung")
+
+    bauvorhaben = metadata.bauvorhaben if metadata else None
+    objekt_nr = metadata.objekt_nr if metadata else None
+    auftraggeber = metadata.auftraggeber if metadata else None
+    submission_date = metadata.submission_date if metadata else None
+    kunde_name = metadata.kunde_name if metadata else None
+    kunde_adresse = metadata.kunde_adresse if metadata else None
+
+    objekt = resolve_or_create_objekt(
+        db,
+        bauvorhaben=bauvorhaben,
+        objekt_nr=objekt_nr,
+        auftraggeber=auftraggeber,
+        submission_date=submission_date,
+    )
+    kunde = resolve_or_create_kunde(
+        db,
+        name=kunde_name or auftraggeber,
+        sender_email=sender_email,
+        address=kunde_adresse,
+    )
+    shareable = find_shareable_project(
+        db,
+        objekt_id=objekt.id,
+        content_hash=content_hash,
+    )
+
     project = LVProject(
         content_hash=content_hash,
+        objekt_id=objekt.id,
+        kunde_id=kunde.id,
         filename=filename,
         project_name=fallback_project_name,
         total_positions=len(positions),
@@ -419,6 +456,7 @@ def _store_new_project(
         service_positions=service,
         pdf_path=pdf_path,
         projekt_nr=_next_project_number(db),
+        anfrage_art=anfrage_art,
     )
     if metadata:
         project.bauvorhaben = metadata.bauvorhaben
@@ -429,6 +467,11 @@ def _store_new_project(
         project.kunde_adresse = metadata.kunde_adresse
         if metadata.bauvorhaben and not project.project_name:
             project.project_name = metadata.bauvorhaben
+
+    if shareable is not None:
+        project.selections_json = shareable.selections_json
+        project.workstate_json = shareable.workstate_json
+
     db.add(project)
     db.flush()
 
@@ -494,7 +537,59 @@ def _upsert_project_upload_file(
     )
 
 
-def _classify_email(subject: str, body: str, attachments: list[_Attachment]) -> str:
+_BEDARF_KEYWORDS = (
+    "bedarf",
+    "bedarfsanfrage",
+    "bedarfsplanung",
+    "zum bedarf",
+    "auftrag erhalten",
+    "auftrag bekommen",
+    "zuschlag erhalten",
+    "zuschlag bekommen",
+)
+
+
+def _detect_anfrage_art(subject: str | None, body: str | None) -> str:
+    """Classify an inbound LV as submission (default) vs bedarf.
+
+    Bedarf = second submission after the Unternehmer actually won the tender;
+    signalled explicitly in the Betreff or Text ("Bedarf", "Zuschlag erhalten", …).
+    Default is submission (Vorab-Anfrage vor Auftragserteilung).
+    """
+    text = f"{subject or ''} {body or ''}".lower()
+    if any(kw in text for kw in _BEDARF_KEYWORDS):
+        return "bedarf"
+    return "submission"
+
+
+def _sender_role(db: Session, sender_email: str | None) -> str | None:
+    """Look up whether the sender is a known customer or supplier.
+
+    Customer match is by Kunde.email_domain (customers share a company domain).
+    Supplier match is by exact Supplier.email. Returns "customer", "supplier",
+    or None.
+    """
+    if not sender_email:
+        return None
+    addr = sender_email.strip().lower()
+    if "@" not in addr:
+        return None
+    domain = addr.split("@", 1)[1]
+    kunde_hit = db.scalar(select(Kunde.id).where(func.lower(Kunde.email_domain) == domain))
+    if kunde_hit is not None:
+        return "customer"
+    supplier_hit = db.scalar(select(Supplier.id).where(func.lower(Supplier.email) == addr))
+    if supplier_hit is not None:
+        return "supplier"
+    return None
+
+
+def _classify_email(
+    subject: str,
+    body: str,
+    attachments: list[_Attachment],
+    sender_role: str | None = None,
+) -> str:
     attachment_names = " ".join(att.filename for att in attachments if att.filename)
     text = f"{subject}\n{body}\n{attachment_names}".lower()
     has_pdf = any(att.is_pdf for att in attachments)
@@ -504,15 +599,19 @@ def _classify_email(subject: str, body: str, attachments: list[_Attachment]) -> 
     has_lv_pdf_hint = any(hint in text for hint in _LV_PDF_HINTS)
     has_ref = "tbx-inq" in text or "tbx-proj" in text
 
-    if has_ref or has_offer_keyword:
+    if sender_role == "customer" and has_pdf and not has_non_lv_pdf_hint:
+        return "new_lv"
+    if has_ref:
+        return "offer"
+    if has_pdf and has_new_lv_keyword and not has_non_lv_pdf_hint:
+        return "new_lv"
+    if has_offer_keyword:
         return "offer"
     if not has_pdf:
         return "ignored"
-    if has_non_lv_pdf_hint and not has_new_lv_keyword and not has_ref:
+    if has_non_lv_pdf_hint and not has_new_lv_keyword:
         return "ignored"
-    if has_new_lv_keyword:
-        return "new_lv"
-    if has_lv_pdf_hint:
+    if has_new_lv_keyword or has_lv_pdf_hint:
         return "new_lv"
     return "ignored"
 
@@ -702,10 +801,18 @@ def _handle_new_lv_email(
     db: Session,
     subject: str,
     attachments: list[_Attachment],
+    sender_email: str | None = None,
+    body: str | None = None,
 ) -> dict[str, object]:
+    from .archive_resolvers import (
+        resolve_or_create_objekt,
+        resolve_or_create_kunde,
+    )
+
     created_project_ids: list[int] = []
     skipped_hashes: list[str] = []
     errors: list[str] = []
+    anfrage_art = _detect_anfrage_art(subject, body)
 
     for attachment in attachments:
         if not attachment.is_pdf:
@@ -714,11 +821,10 @@ def _handle_new_lv_email(
         if not pdf_bytes:
             continue
         content_hash = hashlib.sha256(pdf_bytes).hexdigest()
-        existing = db.scalar(select(LVProject).where(LVProject.content_hash == content_hash))
-        if existing:
-            skipped_hashes.append(content_hash[:12])
-            continue
 
+        # We need the Objekt + Kunde identity BEFORE we can detect a duplicate
+        # on the (objekt_id, kunde_id, content_hash) composite. Parse the LV
+        # first so we have the metadata for Objekt resolution.
         metadata = ProjectMetadata()
         try:
             if settings.gemini_api_key:
@@ -733,6 +839,34 @@ def _handle_new_lv_email(
                 errors.append(f"{attachment.filename}: {fallback_exc}")
                 continue
 
+        # Duplicate check: same (Objekt, Kunde, content_hash) = wirklich identisch.
+        # Gleicher Hash unter einem anderen Kunden = neuer Kundenordner (NICHT skippen).
+        tentative_objekt = resolve_or_create_objekt(
+            db,
+            bauvorhaben=metadata.bauvorhaben,
+            objekt_nr=metadata.objekt_nr,
+            auftraggeber=metadata.auftraggeber,
+            submission_date=metadata.submission_date,
+        )
+        tentative_kunde = resolve_or_create_kunde(
+            db,
+            name=metadata.kunde_name or metadata.auftraggeber,
+            sender_email=sender_email,
+            address=metadata.kunde_adresse,
+        )
+        db.flush()
+        existing = db.scalar(
+            select(LVProject).where(
+                LVProject.content_hash == content_hash,
+                LVProject.objekt_id == tentative_objekt.id,
+                LVProject.kunde_id == tentative_kunde.id,
+                LVProject.anfrage_art == anfrage_art,
+            )
+        )
+        if existing:
+            skipped_hashes.append(content_hash[:12])
+            continue
+
         pdf_path = _store_uploaded_pdf(content_hash, pdf_bytes)
         project = _store_new_project(
             db=db,
@@ -742,6 +876,8 @@ def _handle_new_lv_email(
             metadata=metadata,
             pdf_path=pdf_path,
             fallback_project_name=subject[:255] if subject else None,
+            sender_email=sender_email,
+            anfrage_art=anfrage_art,
         )
         _upsert_project_upload_file(
             db,
@@ -1047,7 +1183,8 @@ def _process_message(
     if already_processed:
         return {"category": "skipped", "message_id": message_key}
 
-    category = _classify_email(subject, body, attachments)
+    role = _sender_role(db, sender_email)
+    category = _classify_email(subject, body, attachments, sender_role=role)
     if category == "offer" and _is_outbound_demo_copy(subject, sender_email, body, attachments):
         category = "ignored"
         result = {"ignored": True, "reason": "outbound_demo_copy"}
@@ -1062,7 +1199,7 @@ def _process_message(
         )
         return {"category": category, "message_id": message_key, **result}
     if category == "new_lv":
-        result = _handle_new_lv_email(db=db, subject=subject, attachments=attachments)
+        result = _handle_new_lv_email(db=db, subject=subject, attachments=attachments, sender_email=sender_email, body=body)
     elif category == "offer":
         result = _handle_offer_email(
             db=db,

@@ -81,6 +81,8 @@ export type ProductSuggestion = {
   sn?: number | null
   load_class?: string | null
   norm?: string | null
+  material?: string | null
+  angle_deg?: number | null
   stock?: number | null
   delivery_days?: number | null
   price_net?: number | null
@@ -94,6 +96,7 @@ export type ProductSuggestion = {
   is_manual?: boolean
   is_override?: boolean
   is_supplier_offer?: boolean
+  is_bogen_fallback?: boolean
   supplier_offer_id?: number | null
   supplier_name?: string | null
 }
@@ -148,11 +151,24 @@ export type ExportWarning = {
   reason: string
 }
 
+export type OfferEmailDefaults = {
+  customer_email?: string | null
+  subject: string
+  body: string
+}
+
 export type ExportPreviewResponse = {
   included_count: number
   total_count: number
   skipped_positions: ExportWarning[]
   total_net: number
+  email_defaults?: OfferEmailDefaults | null
+}
+
+export type SendOfferEmailResponse = {
+  sent: boolean
+  saved: boolean
+  detail?: string | null
 }
 
 export type PriceAdjustmentMode = 'percent' | 'absolute'
@@ -208,10 +224,45 @@ export type ProjectSummary = {
   submission_date?: string | null
   kunde_name?: string | null
   status?: 'neu' | 'offen' | 'anfrage_offen' | 'gerechnet' | string
+  anfrage_art?: 'submission' | 'bedarf' | string
   offer_pdf_path?: string | null
   assigned_user_name?: string | null
   last_editor_name?: string | null
   last_edited_at?: string | null
+}
+
+export type ObjektSummary = {
+  id: number
+  slug: string
+  bauvorhaben: string | null
+  objekt_nr: string | null
+  auftraggeber: string | null
+  submission_date: string | null
+  created_at: string
+  kunden_count: number
+  project_count: number
+  latest_project_created_at: string | null
+}
+
+export type KundenOrdnerSummary = {
+  kunde_id: number
+  slug: string
+  name: string
+  display_name: string | null
+  email_domain: string | null
+  project_count: number
+  latest_project_created_at: string | null
+}
+
+export type ObjektDetailResponse = {
+  objekt: ObjektSummary
+  kunden: KundenOrdnerSummary[]
+}
+
+export type KundenProjektListResponse = {
+  objekt: ObjektSummary
+  kunde: KundenOrdnerSummary
+  projects: ProjectSummary[]
 }
 
 export type AssignmentUiState = {

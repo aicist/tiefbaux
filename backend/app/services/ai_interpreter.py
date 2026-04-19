@@ -190,7 +190,12 @@ NON_CATALOG_KEYWORDS = (
 
 NORM_RE = re.compile(r"(DIN\s*(?:EN\s*)?\d+(?:-\d+)?)", re.IGNORECASE)
 DN_RE = re.compile(r"\bDN\s*([0-9]{1,2}\.?[0-9]{2,3})\b", re.IGNORECASE)
-DIM_RE = re.compile(r"([0-9]{2,4}\s*x\s*[0-9]{2,4}|H\s*=\s*[0-9]{2,4}|Ø\s*[0-9]{2,4})", re.IGNORECASE)
+DIM_RE = re.compile(
+    r"([0-9]{2,4}\s*x\s*[0-9]{2,4}\s*(?:mm|cm)|"
+    r"H\s*=\s*[0-9]{2,4}\s*(?:mm|cm)?|"
+    r"Ø\s*[0-9]{2,4}\s*(?:mm|cm)?)",
+    re.IGNORECASE,
+)
 PIPE_LENGTH_RE = re.compile(
     r"(?:baul[äa]nge|rohrl[äa]nge|l[äa]nge)[:\s]*(\d+)\s*(mm|m)\b",
     re.IGNORECASE,

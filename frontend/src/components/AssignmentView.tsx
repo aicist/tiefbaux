@@ -6,7 +6,7 @@ import { DinBadge } from './DinBadge'
 import { InquiryModal } from './InquiryModal'
 import { PriceAdjustmentControl } from './PriceAdjustmentControl'
 import { ProductSearchModal } from './ProductSearchModal'
-import { computeAdjustedTotal, computeAdjustedUnitPrice, isAdjustedPrice } from '../utils/pricing'
+import { computeAdjustedTotal, computeAdjustedUnitPrice, isAdjustedPrice, resolveEffectivePriceAdjustment } from '../utils/pricing'
 import { additionalAssignmentKey, componentAssignmentKey, primaryAssignmentKey } from '../utils/assignmentKeys'
 import { buildEmbeddedPdfViewerUrl } from '../utils/pdfViewer'
 
@@ -203,6 +203,7 @@ type Props = {
   persistedUiState?: AssignmentUiState | null
   onUiStateChange?: (state: AssignmentUiState) => void
   onRefreshInquiries?: (projectId?: number | null) => Promise<void> | void
+  errorText?: string | null
 }
 
 export function AssignmentView({
@@ -234,6 +235,7 @@ export function AssignmentView({
   persistedUiState,
   onUiStateChange,
   onRefreshInquiries,
+  errorText,
 }: Props) {
   const [currentIndex, setCurrentIndex] = useState(0)
   const [decisions, setDecisions] = useState<Record<string, AssignmentDecision>>(externalDecisions ?? {})
@@ -341,6 +343,14 @@ export function AssignmentView({
   const [showRejectConfirm, setShowRejectConfirm] = useState(false)
   const [showOriginalPdf, setShowOriginalPdf] = useState(false)
   const [carouselIndex, setCarouselIndex] = useState(0)
+  // Clamp to a valid index. After the position changes, carouselSuggestions
+  // updates synchronously while setCarouselIndex(0) only runs in the useEffect
+  // below — so one render can see an out-of-bounds index, which crashes
+  // `carouselSuggestions[carouselIndex].artikel_id`.
+  const safeCarouselIndex = carouselSuggestions.length > 0
+    ? Math.min(Math.max(carouselIndex, 0), carouselSuggestions.length - 1)
+    : 0
+  const currentCarouselSuggestion = carouselSuggestions[safeCarouselIndex]
   const [swipeDir, setSwipeDir] = useState<'up' | 'down' | null>(null)
   const [pendingJumpPositionId, setPendingJumpPositionId] = useState<string | null>(null)
   const progressHydratedRef = useRef(false)
@@ -669,8 +679,8 @@ export function AssignmentView({
           break
         case 'ArrowUp':
           e.preventDefault()
-          if (carouselIndex > 0) {
-            const newIdx = carouselIndex - 1
+          if (safeCarouselIndex > 0) {
+            const newIdx = safeCarouselIndex - 1
             setSwipeDir('up')
             setCarouselIndex(newIdx)
             if (currentPosition && carouselSuggestions[newIdx]) {
@@ -680,8 +690,8 @@ export function AssignmentView({
           break
         case 'ArrowDown':
           e.preventDefault()
-          if (carouselIndex < carouselSuggestions.length - 1) {
-            const newIdx = carouselIndex + 1
+          if (safeCarouselIndex < carouselSuggestions.length - 1) {
+            const newIdx = safeCarouselIndex + 1
             setSwipeDir('down')
             setCarouselIndex(newIdx)
             if (currentPosition && carouselSuggestions[newIdx]) {
@@ -704,7 +714,7 @@ export function AssignmentView({
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [isFinished, searchOpen, showRejectConfirm, carouselSuggestions, currentSelectedArticle, carouselIndex, handleContinue, handleRejectRequest, handleUndo, handleSelectArticle, hasAssignment, goPrev, currentPosition, decisions])
+  }, [isFinished, searchOpen, showRejectConfirm, carouselSuggestions, currentSelectedArticle, safeCarouselIndex, handleContinue, handleRejectRequest, handleUndo, handleSelectArticle, hasAssignment, goPrev, currentPosition, decisions])
 
   // Fetch pending inquiries when assignment is finished
   useEffect(() => {
@@ -849,6 +859,11 @@ export function AssignmentView({
             {hasBlockingInquiries && (
               <p className="summary-export-hint">
                 Angebot erst möglich, solange Lieferantenanfragen offen oder ausstehend sind.
+              </p>
+            )}
+            {errorText && (
+              <p className="summary-export-error" role="alert">
+                {errorText}
               </p>
             )}
             <div className="summary-actions-secondary">
@@ -1263,24 +1278,24 @@ export function AssignmentView({
               )}
               <div className="carousel-header">
                 <span className="carousel-title">
-                  {carouselIndex === 0 ? 'Bester Vorschlag' : `Vorschlag ${carouselIndex + 1}`}
+                  {safeCarouselIndex === 0 ? 'Bester Vorschlag' : `Vorschlag ${safeCarouselIndex + 1}`}
                 </span>
                 <div className="carousel-nav-compact">
                   <button
                     className="carousel-arrow-sm"
-                    disabled={carouselIndex === 0}
-                    onClick={() => { const i = carouselIndex - 1; setSwipeDir('up'); setCarouselIndex(i); if (carouselSuggestions[i]) handleSelectArticle(carouselSuggestions[i].artikel_id) }}
+                    disabled={safeCarouselIndex === 0}
+                    onClick={() => { const i = safeCarouselIndex - 1; setSwipeDir('up'); setCarouselIndex(i); if (carouselSuggestions[i]) handleSelectArticle(carouselSuggestions[i].artikel_id) }}
                     title="Vorheriger Vorschlag (↑)"
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
                       <path d="M18 15l-6-6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                     </svg>
                   </button>
-                  <span className="carousel-indicator">{carouselIndex + 1} / {carouselSuggestions.length}</span>
+                  <span className="carousel-indicator">{safeCarouselIndex + 1} / {carouselSuggestions.length}</span>
                   <button
                     className="carousel-arrow-sm"
-                    disabled={carouselIndex >= carouselSuggestions.length - 1}
-                    onClick={() => { const i = carouselIndex + 1; setSwipeDir('down'); setCarouselIndex(i); if (carouselSuggestions[i]) handleSelectArticle(carouselSuggestions[i].artikel_id) }}
+                    disabled={safeCarouselIndex >= carouselSuggestions.length - 1}
+                    onClick={() => { const i = safeCarouselIndex + 1; setSwipeDir('down'); setCarouselIndex(i); if (carouselSuggestions[i]) handleSelectArticle(carouselSuggestions[i].artikel_id) }}
                     title="Nächster Vorschlag (↓)"
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
@@ -1290,22 +1305,22 @@ export function AssignmentView({
                 </div>
               </div>
               <div
-                key={carouselIndex}
+                key={safeCarouselIndex}
                 className={`carousel-card-animated ${swipeDir === 'down' ? 'swipe-up-enter' : swipeDir === 'up' ? 'swipe-down-enter' : ''}`}
               >
-                {renderSuggestionCard(
-                  carouselSuggestions[carouselIndex],
+                {currentCarouselSuggestion && renderSuggestionCard(
+                  currentCarouselSuggestion,
                   currentPosition,
                   showLoadClass,
-                  carouselIndex === 0,
+                  safeCarouselIndex === 0,
                   undefined,
                   currentSelectedArticles,
-                  () => handleSelectArticle(carouselSuggestions[carouselIndex].artikel_id),
+                  () => handleSelectArticle(currentCarouselSuggestion.artikel_id),
                   () => {
-                    setInquiryProductName(carouselSuggestions[carouselIndex].artikelname)
+                    setInquiryProductName(currentCarouselSuggestion.artikelname)
                     setInquiryOpen(true)
                   },
-                  offerSourcesByArtikelId[carouselSuggestions[carouselIndex].artikel_id],
+                  offerSourcesByArtikelId[currentCarouselSuggestion.artikel_id],
                 )}
               </div>
               {currentPrimaryAssignmentKey && currentSelectedArticle && (
@@ -1339,8 +1354,8 @@ export function AssignmentView({
                   {carouselSuggestions.map((_, i) => (
                     <button
                       key={i}
-                      className={`carousel-dot ${i === carouselIndex ? 'active' : ''}`}
-                      onClick={() => { setSwipeDir(i > carouselIndex ? 'down' : 'up'); setCarouselIndex(i); if (carouselSuggestions[i]) handleSelectArticle(carouselSuggestions[i].artikel_id) }}
+                      className={`carousel-dot ${i === safeCarouselIndex ? 'active' : ''}`}
+                      onClick={() => { setSwipeDir(i > safeCarouselIndex ? 'down' : 'up'); setCarouselIndex(i); if (carouselSuggestions[i]) handleSelectArticle(carouselSuggestions[i].artikel_id) }}
                     />
                   ))}
                 </div>
@@ -1452,7 +1467,11 @@ export function AssignmentView({
                       )}
                     </div>
                     <PriceAdjustmentControl
-                      adjustment={priceAdjustments[assignmentKey]}
+                      adjustment={resolveEffectivePriceAdjustment(
+                        priceAdjustments[assignmentKey],
+                        currentPriceAdjustment,
+                        pricingReferenceSuggestion?.price_net,
+                      )}
                       baseUnitPrice={art.price_net}
                       quantity={currentPosition.quantity}
                       currency={art.currency}
@@ -1692,6 +1711,25 @@ function renderSuggestionCard(
           label={suggestion.load_class}
           status={!position.parameters.load_class ? 'neutral' : position.parameters.load_class.toUpperCase() === suggestion.load_class.toUpperCase() ? 'match' : 'mismatch'}
         />}
+        {suggestion.material && (() => {
+          const req = position.parameters.material
+          const prod = suggestion.material.toLowerCase()
+          const status: 'match' | 'mismatch' | 'neutral' = !req
+            ? 'neutral'
+            : prod.includes(req.toLowerCase()) || req.toLowerCase().includes(prod)
+              ? 'match'
+              : 'mismatch'
+          return <ParamBadge label={suggestion.material} status={status} />
+        })()}
+        {suggestion.angle_deg != null && (() => {
+          const req = position.parameters.angle_deg
+          const status: 'match' | 'mismatch' | 'neutral' = req == null
+            ? 'neutral'
+            : req === suggestion.angle_deg
+              ? 'match'
+              : 'mismatch'
+          return <ParamBadge label={`${suggestion.angle_deg}°`} status={status} />
+        })()}
         {shouldShowNormBadge(position, suggestion) && suggestion.norm && (
           <span className={`param-badge param-${!position.parameters.norm ? 'neutral' : suggestion.norm.toLowerCase().includes(position.parameters.norm.toLowerCase()) ? 'match' : 'mismatch'}`}>
             <DinBadge norm={suggestion.norm} />
@@ -1755,8 +1793,9 @@ function renderSuggestionCard(
         </div>
       )}
 
-      {filteredReasons.length > 0 && (() => {
-        return filteredReasons.length > 0 ? (
+      {filteredReasons.length > 0 && (
+        <details className="reason-details" onClick={e => e.stopPropagation()}>
+          <summary className="reason-details-summary">Matching-Details</summary>
           <div className="reason-chips">
             {filteredReasons.map((reason) => {
               const lower = reason.toLowerCase()
@@ -1766,8 +1805,8 @@ function renderSuggestionCard(
               )
             })}
           </div>
-        ) : null
-      })()}
+        </details>
+      )}
     </div>
   )
 }

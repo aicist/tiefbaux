@@ -34,7 +34,7 @@ export function Header({ activeView, onViewChange, user, onLogout }: Props) {
             className={`view-tab ${activeView === 'archive' ? 'view-tab--active' : ''}`}
             onClick={() => onViewChange('archive')}
           >
-            Projektarchiv
+            Objektarchiv
           </button>
           <button
             className={`view-tab ${activeView === 'radar' ? 'view-tab--active' : ''}`}

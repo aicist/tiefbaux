@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -71,11 +71,51 @@ class Product(Base):
 Index("ix_products_category_dn", Product.kategorie, Product.unterkategorie, Product.nennweite_dn)
 
 
+class Objekt(Base):
+    """A construction object (Bauvorhaben) identified by bauvorhaben + objekt_nr + auftraggeber.
+
+    Multiple LV-Projekte können unter einem Objekt hängen, wenn verschiedene
+    Kunden dasselbe Bauvorhaben bei Fassbender anfragen.
+    """
+    __tablename__ = "objekte"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    bauvorhaben: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    objekt_nr: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    auftraggeber: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    submission_date: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    projekte = relationship("LVProject", back_populates="objekt")
+
+
+class Kunde(Base):
+    """A customer (Einreichender) — the company submitting LVs to Fassbender.
+
+    Kein Bauherr — das ist ``Objekt.auftraggeber``. Kunde ist der Einreichende
+    (z. B. Strabag, Matthäi), der ein LV zur Preisanfrage schickt.
+    """
+    __tablename__ = "kunden"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(256))
+    email_domain: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True)
+    display_name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    address: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    projekte = relationship("LVProject", back_populates="kunde")
+
+
 class LVProject(Base):
     __tablename__ = "lv_projects"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    content_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    objekt_id: Mapped[Optional[int]] = mapped_column(ForeignKey("objekte.id"), index=True, nullable=True)
+    kunde_id: Mapped[Optional[int]] = mapped_column(ForeignKey("kunden.id"), index=True, nullable=True)
     filename: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     project_name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     total_positions: Mapped[int] = mapped_column(Integer, default=0)
@@ -105,6 +145,10 @@ class LVProject(Base):
     # Project status: "neu", "offen", "anfrage_offen", "gerechnet"
     status: Mapped[str] = mapped_column(String(16), default="neu", index=True)
 
+    # Anfrage-Art: "submission" (Vorab-Anfrage vor Auftragserteilung) oder
+    # "bedarf" (Bedarfsanfrage nach Auftragserteilung — jetzt wirds ernst).
+    anfrage_art: Mapped[str] = mapped_column(String(16), default="submission", index=True)
+
     # Offer PDF storage
     offer_pdf_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
@@ -116,6 +160,18 @@ class LVProject(Base):
     positions = relationship("LVProjectPosition", back_populates="project", cascade="all, delete-orphan")
     assigned_user = relationship("User", foreign_keys=[assigned_user_id])
     last_editor = relationship("User", foreign_keys=[last_editor_id])
+    objekt = relationship("Objekt", back_populates="projekte")
+    kunde = relationship("Kunde", back_populates="projekte")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "objekt_id",
+            "kunde_id",
+            "content_hash",
+            "anfrage_art",
+            name="uq_project_objekt_kunde_hash_art",
+        ),
+    )
 
 
 class LVProjectPosition(Base):
